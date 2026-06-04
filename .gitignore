@@ -1,0 +1,65 @@
+# Dependencies
+node_modules/
+client/node_modules/
+server/node_modules/
+
+# Build outputs
+client/dist/
+release/
+dist/
+
+# Runtime data and logs
+server/logs/
+server/tmp/
+client/tmp/
+mysql_data/
+server/qrcodes/
+tmp_wechat_windows/
+
+# Generated temp artifacts
+*.log
+*.tmp
+*.tmp.log
+*.out.log
+*.err.log
+*.png
+*.jpg
+*.jpeg
+*.webp
+@AutomationLog.txt
+tmp_*.png
+
+# Local scratch files
+server/debug_*
+server/browser_*.js
+server/delete_video.js
+server/restore_video.js
+server/test_proxy_scrape.js
+server/wx_*.py
+server/wechat_*.py
+server/fix_*.py
+server/src/*.py
+server/src/*.fixed
+server/src/*.corrupted
+server/src/*.new.js
+server/src/done.txt
+server/src/fixer.js
+server/src/restore.py
+server/src/restore_scraper.js
+server/src/fix_bytes.py
+server/src/fix_encoding.py
+server/src/fix_encoding2.py
+server/src/fix_vh.js
+server/src/gen_vh.py
+server/src/generate_vh.py
+patch_acct.js
+chat_history_export.md
+douyin_api_analysis_report.md
+ui_light_cyberpunk.html
+videohao-scraper.js
+
+# OS cruft
+.DS_Store
+Thumbs.db
+__pycache__/
+*.pyc
