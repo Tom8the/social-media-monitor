@@ -79,10 +79,10 @@ class VideohaoLocalProxy {
   }
 
   async stop() {
-    if (this.proxy) {
-      await new Promise(resolve => this.proxy.close(resolve));
-      this.proxy = null;
-    }
+    await this._closeProxyServer('stop');
+    await this.disableSystemProxy().catch(error => {
+      this._pushEvent('system:proxy-disable-on-stop-failed', { message: error.message });
+    });
     this.activeAccount = null;
     this._pushEvent('proxy:stopped', {});
     return { success: true };
@@ -112,11 +112,52 @@ class VideohaoLocalProxy {
   }
 
   async configureSystem(accountId, port = this.port) {
+    const hadProxy = !!this.proxy;
     const startResult = await this.start(accountId, port);
     if (!startResult.success) return startResult;
 
     const certResult = await this.installCertificate();
+    if (!certResult.success) {
+      await this._cleanupDesktopAutomation('configure-cert-failed', hadProxy);
+      return {
+        success: false,
+        data: {
+          ...this.getStatus(),
+          certificate: certResult
+        },
+        error: certResult.error
+      };
+    }
+    let preflightResult = { success: true, skipped: true, reason: 'not-public-account' };
+    if (this.activeAccount?.status === 'public') {
+      preflightResult = await this.preflightDesktopWeChatAutomation();
+      if (!preflightResult.success) {
+        await this._cleanupDesktopAutomation('configure-preflight-failed', hadProxy);
+        return {
+          success: false,
+          data: {
+            ...this.getStatus(),
+            certificate: certResult,
+            preflight: preflightResult
+          },
+          error: preflightResult.error
+        };
+      }
+    }
     const proxyResult = await this.enableSystemProxy();
+    if (!proxyResult.success) {
+      await this._cleanupDesktopAutomation('configure-proxy-failed', hadProxy);
+      return {
+        success: false,
+        data: {
+          ...this.getStatus(),
+          certificate: certResult,
+          systemProxy: proxyResult,
+          preflight: preflightResult
+        },
+        error: proxyResult.error || '视频号本地代理开启失败'
+      };
+    }
     let automationResult = { success: true, skipped: true, reason: 'not-public-account' };
     if (this.activeAccount?.status === 'public') {
       automationResult = await this.autoOpenInDesktopWeChat(this.activeAccount);
@@ -127,6 +168,7 @@ class VideohaoLocalProxy {
         ...this.getStatus(),
         certificate: certResult,
         systemProxy: proxyResult,
+        preflight: preflightResult,
         automation: automationResult
       },
       error: certResult.error || proxyResult.error || automationResult.error || null
@@ -147,6 +189,7 @@ class VideohaoLocalProxy {
   }
 
   async desktopSync(accountId, options = {}) {
+    const hadProxy = !!this.proxy;
     if (accountId && this.activeAccount?.id !== accountId) {
       const startResult = await this.start(accountId);
       if (!startResult.success) return startResult;
@@ -155,8 +198,39 @@ class VideohaoLocalProxy {
       return { success: false, unavailable: true, error: '未找到待采集的视频号账号' };
     }
 
-    await this.installCertificate();
-    await this.enableSystemProxy();
+    const certResult = await this.installCertificate();
+    if (!certResult.success) {
+      await this._cleanupDesktopAutomation('desktop-sync-cert-failed', hadProxy);
+      return {
+        success: false,
+        unavailable: true,
+        error: certResult.error || '视频号本地代理证书安装失败，无法启动桌面微信采集',
+        certificate: certResult
+      };
+    }
+    await this.closeDesktopWeChatSearchWindows().catch(error => {
+      this._pushEvent('automation:pre-clean-search-windows-skipped', { error: error.message });
+    });
+    const preflightResult = await this.preflightDesktopWeChatAutomation();
+    if (!preflightResult.success) {
+      await this._cleanupDesktopAutomation('desktop-sync-preflight-failed', hadProxy);
+      return {
+        success: false,
+        unavailable: true,
+        error: preflightResult.error,
+        preflight: preflightResult
+      };
+    }
+    const proxyResult = await this.enableSystemProxy();
+    if (!proxyResult.success) {
+      await this._cleanupDesktopAutomation('desktop-sync-proxy-failed', hadProxy);
+      return {
+        success: false,
+        unavailable: true,
+        error: proxyResult.error || '视频号本地代理开启失败',
+        systemProxy: proxyResult
+      };
+    }
 
     let automationResult = null;
     try {
@@ -189,9 +263,7 @@ class VideohaoLocalProxy {
         automation: automationResult
       };
     } finally {
-      await this.closeDesktopWeChatSearchWindows().catch(error => {
-        this._pushEvent('automation:search-windows-close-skipped', { error: error.message });
-      });
+      await this._cleanupDesktopAutomation('desktop-sync', hadProxy);
     }
   }
 
@@ -270,7 +342,7 @@ class VideohaoLocalProxy {
     return status;
   }
 
-  async autoOpenInDesktopWeChat(account = this.activeAccount) {
+  async autoOpenInDesktopWeChat(account = this.activeAccount, options = {}) {
     if (!account) {
       return { success: false, error: '未找到待采集的视频号账号' };
     }
@@ -288,12 +360,18 @@ class VideohaoLocalProxy {
       };
     }
 
-    const result = await this._execFile('python', [scriptPath, keyword], 60000);
+    const args = [scriptPath, keyword];
+    if (options.maxAttempts) {
+      args.push(String(options.maxAttempts));
+    }
+    const result = await this._execFile('python', args, 60000);
 
     if (!result.success) {
       const output = `${result.stdout || ''}\n${result.stderr || ''}`;
       const missingWindow = output.includes('__AUTO_WECHAT_NO_WINDOW__');
-      const blueWindow = output.includes('__AUTO_WECHAT_SKIP_BLUE_WINDOW__');
+      const blueWindow = output.includes('__AUTO_WECHAT_SKIP_BLUE_WINDOW__') ||
+        output.includes('__AUTO_WECHAT_BLUE_WINDOW_STUCK__') ||
+        output.includes('__AUTO_WECHAT_BLUE_WINDOW__');
       const loginRequired = output.includes('__AUTO_WECHAT_LOGIN_REQUIRED__');
       const openFailed = output.includes('__AUTO_WECHAT_OPEN_FAILED__');
       const error = loginRequired
@@ -338,6 +416,61 @@ class VideohaoLocalProxy {
     return result.success ? { success: true } : { success: false, error: result.error };
   }
 
+  async _cleanupDesktopAutomation(reason, hadProxy) {
+    await this.closeDesktopWeChatSearchWindows().catch(error => {
+      this._pushEvent('automation:search-windows-close-skipped', { reason, error: error.message });
+    });
+    await this.disableSystemProxy().catch(error => {
+      this._pushEvent('system:desktop-automation-proxy-disable-failed', { reason, message: error.message });
+    });
+    if (!hadProxy && this.proxy) {
+      await this._closeProxyServer(reason);
+    }
+  }
+
+  async preflightDesktopWeChatAutomation() {
+    const scriptPath = path.join(__dirname, '..', 'wx_auto_open_videohao.py');
+    if (!fs.existsSync(scriptPath)) {
+      return { success: false, error: '未找到桌面微信自动化脚本' };
+    }
+
+    const result = await this._execFile('python', [scriptPath, '__preflight__'], 18000);
+    const output = `${result.stdout || ''}\n${result.stderr || ''}`;
+    const ok = result.success && output.includes('__AUTO_WECHAT_PREFLIGHT_OK__');
+    const blueWindow = output.includes('__AUTO_WECHAT_BLUE_WINDOW_STUCK__') || output.includes('__AUTO_WECHAT_BLUE_WINDOW__');
+    const loginRequired = output.includes('__AUTO_WECHAT_LOGIN_REQUIRED__');
+    const missingWindow = output.includes('__AUTO_WECHAT_NO_WINDOW__');
+    const processOnly = output.includes('__AUTO_WECHAT_STATUS_PROCESS_ONLY__');
+    const error = ok
+      ? null
+      : loginRequired
+        ? '桌面微信尚未登录，请先登录微信主界面后再采集'
+        : blueWindow
+          ? '检测到桌面微信视频号窗口异常（蓝屏/空白）。已停止采集，请完全退出微信后重新打开主界面再试'
+          : processOnly
+            ? '检测到微信进程正在运行，但没有可操作的微信主窗口。请手动打开微信主界面后再采集'
+            : missingWindow
+              ? '未检测到可操作的桌面微信窗口，请先打开并登录微信'
+              : '桌面微信预检失败，请确认微信主窗口可操作';
+
+    this._pushEvent(ok ? 'automation:preflight-ok' : 'automation:preflight-failed', {
+      error,
+      stdout: (result.stdout || '').slice(-1000),
+      stderr: (result.stderr || '').slice(-1000)
+    });
+
+    return {
+      success: ok,
+      error,
+      blueWindow,
+      loginRequired,
+      missingWindow,
+      processOnly,
+      stdout: (result.stdout || '').slice(-1000),
+      stderr: (result.stderr || '').slice(-1000)
+    };
+  }
+
   async checkDesktopWeChatStatus() {
     const scriptPath = path.join(__dirname, '..', 'wx_auto_open_videohao.py');
     if (!fs.existsSync(scriptPath)) {
@@ -350,7 +483,8 @@ class VideohaoLocalProxy {
     const missingWindow = output.includes('__AUTO_WECHAT_NO_WINDOW__');
     const processOnly = output.includes('__AUTO_WECHAT_STATUS_PROCESS_ONLY__');
     const minimized = output.includes('__AUTO_WECHAT_STATUS_MINIMIZED__');
-    const available = result.success && (output.includes('__AUTO_WECHAT_STATUS_OK__') || processOnly || minimized);
+    const blueWindow = output.includes('__AUTO_WECHAT_BLUE_WINDOW_STUCK__') || output.includes('__AUTO_WECHAT_BLUE_WINDOW__');
+    const available = result.success && (output.includes('__AUTO_WECHAT_STATUS_OK__') || minimized);
     return {
       available,
       hasCookie: available,
@@ -359,12 +493,19 @@ class VideohaoLocalProxy {
       mode: 'desktop-wechat',
       processOnly,
       minimized,
+      blueWindow,
       loginRequired,
       missingWindow,
       updatedAt: new Date().toISOString(),
       message: available
         ? (processOnly || minimized ? '桌面微信已在后台运行' : '桌面微信已开启')
-        : (loginRequired ? '桌面微信未登录' : missingWindow ? '未检测到桌面微信' : '桌面微信状态检测失败'),
+        : (loginRequired
+          ? '桌面微信未登录'
+          : blueWindow
+            ? '桌面微信视频号窗口异常，请完全退出微信后重新打开'
+            : processOnly
+              ? '微信进程已运行，但未检测到主窗口'
+              : missingWindow ? '未检测到桌面微信' : '桌面微信状态检测失败'),
       stdout: (result.stdout || '').slice(-1000),
       stderr: (result.stderr || '').slice(-1000)
     };
@@ -385,6 +526,8 @@ class VideohaoLocalProxy {
       sec_uid: null
     };
 
+    const previousAccount = this.activeAccount;
+    const hadProxy = !!this.proxy;
     this.activeAccount = probeAccount;
     this.suppressPostPersistence = true;
     try {
@@ -392,21 +535,57 @@ class VideohaoLocalProxy {
       if (!this.proxy) {
         await this._listen();
       }
-      await this.enableSystemProxy();
+      const certResult = await this.installCertificate();
+      if (!certResult.success) {
+        return {
+          success: false,
+          error: certResult.error || '视频号本地代理证书安装失败，无法打开微信视频号页面',
+          certificate: certResult
+        };
+      }
+      await this.closeDesktopWeChatSearchWindows().catch(error => {
+        this._pushEvent('automation:resolve-pre-clean-search-windows-skipped', { error: error.message });
+      });
+      const preflightResult = await this.preflightDesktopWeChatAutomation();
+      if (!preflightResult.success) {
+        return {
+          success: false,
+          error: preflightResult.error,
+          preflight: preflightResult
+        };
+      }
+      const proxyResult = await this.enableSystemProxy();
+      if (!proxyResult.success) {
+        return {
+          success: false,
+          error: proxyResult.error || '视频号本地代理开启失败',
+          systemProxy: proxyResult
+        };
+      }
 
       const before = Date.now();
-      const automationResult = await this.autoOpenInDesktopWeChat(probeAccount);
-      if (!automationResult.success) return automationResult;
+      const automationResult = await this.autoOpenInDesktopWeChat(probeAccount, { maxAttempts: 1 });
+      if (!automationResult.success) {
+        const capturedData = this._getResolvedAccountDataIfCaptured(nickname, before);
+        if (capturedData) {
+          this._pushEvent('automation:resolve-used-captured-identity', {
+            nickname,
+            unique_id: capturedData.unique_id,
+            automationError: automationResult.error || ''
+          });
+          return {
+            success: true,
+            data: capturedData,
+            automation: automationResult
+          };
+        }
+        return automationResult;
+      }
 
       const deadline = Date.now() + (Number(options.timeout) || 20000);
       while (Date.now() < deadline) {
-        const resolved = this._normalizeFinderIdentity(this.activeAccount?.unique_id);
-        if (resolved && resolved.includes('@finder') && !resolved.startsWith('pending:')) {
-          const data = this._buildResolvedAccountData({
-            nickname,
-            finderUsername: resolved,
-            capturedAfter: before
-          });
+        const data = this._getResolvedAccountDataIfCaptured(nickname, before);
+        if (data) {
           await this.closeDesktopWeChatSearchWindows().catch(() => {});
           return {
             success: true,
@@ -422,6 +601,16 @@ class VideohaoLocalProxy {
       };
     } finally {
       this.suppressPostPersistence = false;
+      this.activeAccount = previousAccount || null;
+      await this.closeDesktopWeChatSearchWindows().catch(error => {
+        this._pushEvent('automation:resolve-search-windows-close-skipped', { error: error.message });
+      });
+      await this.disableSystemProxy().catch(error => {
+        this._pushEvent('system:resolve-proxy-disable-failed', { message: error.message });
+      });
+      if (!hadProxy && this.proxy) {
+        await this._closeProxyServer('resolve');
+      }
     }
   }
 
@@ -443,20 +632,63 @@ class VideohaoLocalProxy {
     };
   }
 
+  _getResolvedAccountDataIfCaptured(nickname, capturedAfter = 0) {
+    const eventProfile = [...this.lastEvents]
+      .reverse()
+      .find(event => {
+        if (event.type !== 'account:identity-refreshed') return false;
+        const payload = event.payload || {};
+        if (payload.accountId && this.activeAccount?.id && payload.accountId !== this.activeAccount.id) return false;
+        if (payload.nickname && nickname && payload.nickname !== nickname) return false;
+        return this._normalizeFinderIdentity(payload.unique_id).includes('@finder');
+      });
+    const activeUsername = this._normalizeFinderIdentity(this.activeAccount?.unique_id);
+    const profileUsername = this.lastResolvedProfile?.capturedAt >= capturedAfter
+      ? this._normalizeFinderIdentity(this.lastResolvedProfile?.username)
+      : '';
+    const eventUsername = this._normalizeFinderIdentity(eventProfile?.payload?.unique_id);
+    const resolved = [activeUsername, profileUsername, eventUsername]
+      .find(value => value && value.includes('@finder') && !value.startsWith('pending:'));
+    if (!resolved || !resolved.includes('@finder') || resolved.startsWith('pending:')) {
+      return null;
+    }
+    return this._buildResolvedAccountData({
+      nickname,
+      finderUsername: resolved,
+      capturedAfter
+    });
+  }
+
   async installCertificate() {
     const caPath = this.getCaPath();
     if (!fs.existsSync(caPath)) {
       return { success: false, error: 'CA证书尚未生成，请先启动本地采集代理' };
     }
 
-    const result = await this._execFile('certutil.exe', ['-user', '-addstore', 'Root', caPath]);
-    this._pushEvent(result.success ? 'system:cert-installed' : 'system:cert-install-failed', {
+    const expectedSha1 = await this._getCertificateFileSha1(caPath).catch(() => '');
+    await this._execFile('certutil.exe', ['-user', '-addstore', 'Root', caPath]).catch(() => {});
+    const result = await this._execFile('certutil.exe', ['-addstore', 'Root', caPath]);
+    const needsAdmin = !result.success && /管理员|提升|elevat|access is denied|denied/i.test(result.error || '');
+    const trusted = expectedSha1 ? await this._isCertificateTrustedInMachineRoot(expectedSha1).catch(() => false) : result.success;
+    this._pushEvent(trusted ? 'system:cert-trusted' : 'system:cert-install-failed', {
       caPath,
+      store: 'LocalMachine Root',
+      expectedSha1,
+      trusted,
+      needsAdmin,
       message: result.error || result.stdout.slice(-200)
     });
-    return result.success
-      ? { success: true, caPath }
-      : { success: false, caPath, error: result.error };
+    return trusted
+      ? { success: true, caPath, sha1: expectedSha1 }
+      : {
+          success: false,
+          caPath,
+          sha1: expectedSha1,
+          needsAdmin,
+          error: needsAdmin
+            ? '视频号本地代理证书需要安装到“本机-受信任的根证书颁发机构”，请以管理员权限运行 install-videohao-ca-admin.bat 后再添加视频号'
+            : '当前视频号代理 CA 证书未被微信信任，请以管理员权限运行 install-videohao-ca-admin.bat 安装当前证书'
+        };
   }
 
   async enableSystemProxy() {
@@ -476,11 +708,29 @@ class VideohaoLocalProxy {
   async disableSystemProxy() {
     const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
     const result = await this._execFile('reg.exe', ['add', key, '/v', 'ProxyEnable', '/t', 'REG_DWORD', '/d', '0', '/f']);
+    const clearServer = await this._execFile('reg.exe', ['delete', key, '/v', 'ProxyServer', '/f']);
     await this._notifyProxyChanged();
-    this._pushEvent(result.success ? 'system:proxy-disabled' : 'system:proxy-disable-failed', {
-      message: result.error || result.stdout.slice(-200)
+    const success = result.success && (clearServer.success || String(clearServer.error || '').includes('unable to find') || String(clearServer.error || '').includes('找不到'));
+    this._pushEvent(success ? 'system:proxy-disabled' : 'system:proxy-disable-failed', {
+      message: result.error || clearServer.error || result.stdout.slice(-200)
     });
-    return result.success ? { success: true } : { success: false, error: result.error };
+    return success ? { success: true } : { success: false, error: result.error || clearServer.error };
+  }
+
+  async _closeProxyServer(reason = 'manual') {
+    if (!this.proxy) return { success: true, skipped: true };
+    const proxy = this.proxy;
+    this.proxy = null;
+    let timedOut = false;
+    await Promise.race([
+      new Promise(resolve => proxy.close(resolve)),
+      new Promise(resolve => setTimeout(() => {
+        timedOut = true;
+        resolve();
+      }, 3000))
+    ]);
+    this._pushEvent(timedOut ? 'proxy:close-timeout' : 'proxy:closed', { reason });
+    return { success: !timedOut, timedOut };
   }
 
   async _notifyProxyChanged() {
@@ -503,6 +753,19 @@ class VideohaoLocalProxy {
         resolve({ success: true, stdout, stderr });
       });
     });
+  }
+
+  async _getCertificateFileSha1(caPath) {
+    const cert = new crypto.X509Certificate(fs.readFileSync(caPath));
+    return String(cert.fingerprint || '').replace(/:/g, '').toLowerCase();
+  }
+
+  async _isCertificateTrustedInMachineRoot(sha1) {
+    const expected = String(sha1 || '').replace(/\s/g, '').toLowerCase();
+    if (!expected) return false;
+    const result = await this._execFile('certutil.exe', ['-store', 'Root', 'NodeMITMProxyCA']);
+    const output = `${result.stdout || ''}\n${result.stderr || ''}`.replace(/\s/g, '').toLowerCase();
+    return output.includes(expected);
   }
 
   _getBackgroundBridgeStatus() {
@@ -849,6 +1112,12 @@ class VideohaoLocalProxy {
       }
       await this._refreshActiveAccountIdentity(bridgeTarget.username);
       this._rememberResolvedProfile(bridgePayload, bridgeTarget.username);
+      await this._persistActiveAccountProfile(this._extractCapturedProfile(bridgePayload)).catch(error => {
+        this._pushEvent('account:profile-update-failed', {
+          accountId: this.activeAccount?.id,
+          message: error.message
+        });
+      });
       const saved = await this._savePosts(this._extractPostsFromJson(bridgePayload), fullUrl);
       this._pushEvent('capture:bridge', {
         accountId: this.activeAccount.id,
@@ -980,6 +1249,60 @@ class VideohaoLocalProxy {
       ...profile,
       capturedAt: Date.now()
     };
+  }
+
+  _extractCapturedProfile(bridgePayload) {
+    if (!bridgePayload || typeof bridgePayload !== 'object') return null;
+    if (bridgePayload.kind === 'profile-store') {
+      const payload = bridgePayload.payload || {};
+      const contact = payload.contact || {};
+      const username = this._normalizeFinderIdentity(firstPresent(
+        payload.username,
+        contact.username
+      ));
+      const profile = {
+        username,
+        nickname: firstPresent(contact.nickname, payload.nickname) || '',
+        avatar: firstPresent(contact.headUrl, contact.head_url, payload.avatar) || '',
+        signature: firstPresent(contact.signature, payload.signature) || '',
+        video_count: parseCount(firstPresent(payload.originalCount, payload.original_count)),
+        follower_count: parseCount(firstPresent(payload.fansCount, payload.fans_count))
+      };
+      return (profile.nickname || profile.avatar || profile.follower_count || profile.username) ? profile : null;
+    }
+    return this._extractBridgeResponseProfile(bridgePayload);
+  }
+
+  async _persistActiveAccountProfile(profile) {
+    if (!this.activeAccount || !profile) return false;
+    const updates = { last_fetch_at: new Date().toISOString() };
+    const username = this._normalizeFinderIdentity(profile.username);
+    if (username && this._shouldPersistResolvedUsername(username, [
+      this._normalizeFinderIdentity(this.activeAccount.unique_id),
+      this._normalizeFinderIdentity(this.activeAccount.sec_uid)
+    ].filter(Boolean))) {
+      updates.unique_id = username;
+      updates.sec_uid = username;
+    }
+    if (profile.nickname) updates.nickname = profile.nickname;
+    if (profile.avatar) updates.avatar = profile.avatar;
+    if (profile.signature) updates.signature = profile.signature;
+    if (Number(profile.follower_count) > 0) updates.follower_count = Number(profile.follower_count);
+    if (Number(profile.video_count) > 0) updates.video_count = Number(profile.video_count);
+
+    if (Object.keys(updates).length <= 1) return false;
+    await database.updateAccount(this.activeAccount.id, updates);
+    this.activeAccount = {
+      ...this.activeAccount,
+      ...updates
+    };
+    this._pushEvent('account:profile-updated', {
+      accountId: this.activeAccount.id,
+      nickname: this.activeAccount.nickname,
+      hasAvatar: !!this.activeAccount.avatar,
+      followerCount: this.activeAccount.follower_count || 0
+    });
+    return true;
   }
 
   async _refreshActiveAccountIdentity(username) {

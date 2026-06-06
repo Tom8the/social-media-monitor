@@ -740,14 +740,49 @@ router.post('/fetch-from-url', async (req, res) => {
 
     // 1. 从粘贴文本中提取URL
     const cleanUrl = extractUrl(url);
-    if (!cleanUrl) {
+    const douyinKeyword = platform === 'douyin' && !cleanUrl ? String(url || '').trim() : '';
+    const xhsKeyword = platform === 'xiaohongshu' && !cleanUrl ? String(url || '').trim() : '';
+    if (!cleanUrl && !douyinKeyword && !xhsKeyword) {
+      return res.status(400).json({ code: 400, message: '未检测到有效链接，请检查输入' });
+    }
+    if (!cleanUrl && !['douyin', 'xiaohongshu'].includes(platform)) {
       return res.status(400).json({ code: 400, message: '未检测到有效链接，请检查输入' });
     }
 
     console.log(`[采集] 原始输入: ${url}`);
-    console.log(`[采集] 提取URL: ${cleanUrl}`);
+    console.log(`[采集] 提取URL: ${cleanUrl || (douyinKeyword ? '(抖音账号名称搜索)' : '(小红书账号名称搜索)')}`);
 
     let fetchCookies = null;
+    if (douyinKeyword) {
+      const globalCookie = await getGlobalCookie('douyin');
+      if (!globalCookie || !globalCookie.cookieData) {
+        return res.status(401).json({
+          code: 401,
+          message: '抖音账号名称搜索需要先扫码获取全局Cookie',
+          data: { needGlobalCookie: true, platform: 'douyin' }
+        });
+      }
+      try {
+        fetchCookies = JSON.parse(globalCookie.cookieData);
+      } catch (e) {
+        await invalidateGlobalCookie('douyin');
+        return res.status(401).json({
+          code: 401,
+          message: '抖音全局Cookie已失效，请重新扫码',
+          data: { needGlobalCookie: true, platform: 'douyin' }
+        });
+      }
+    } else if (platform === 'douyin') {
+      const globalCookie = await getGlobalCookie('douyin');
+      if (globalCookie && globalCookie.cookieData) {
+        try {
+          fetchCookies = JSON.parse(globalCookie.cookieData);
+        } catch (e) {
+          await invalidateGlobalCookie('douyin');
+          fetchCookies = null;
+        }
+      }
+    }
     if (platform === 'xiaohongshu') {
       const globalCookie = await getGlobalCookie('xiaohongshu');
       if (!globalCookie || !globalCookie.cookieData) {
@@ -771,7 +806,13 @@ router.post('/fetch-from-url', async (req, res) => {
 
     // 2. 使用 Playwright 打开链接，获取页面数据
     const platformScraper = platform === 'xiaohongshu' ? xhsScraper : scraper;
-    const result = await platformScraper.fetchFromLink(cleanUrl, fetchCookies);
+    const result = douyinKeyword
+      ? await scraper.fetchFromKeyword(douyinKeyword, fetchCookies)
+      : (xhsKeyword
+        ? await xhsScraper.fetchFromKeyword(xhsKeyword, fetchCookies, { useCreatorProfile: false })
+        : (platform === 'xiaohongshu'
+        ? await platformScraper.fetchFromLink(cleanUrl, fetchCookies, { useCreatorProfile: false })
+        : await platformScraper.fetchFromLink(cleanUrl, fetchCookies)));
 
     if (!result.success) {
       if (platform === 'xiaohongshu' && result.cookieExpired) {
@@ -935,6 +976,44 @@ router.get('/batch-sync/:jobId', async (req, res) => {
       return res.status(404).json({ code: 404, message: '任务不存在' });
     }
     res.json({ code: 0, data: job });
+  } catch (error) {
+    res.status(500).json({ code: 500, message: error.message });
+  }
+});
+
+// 只同步账号资料：头像、昵称、粉丝数等；不采集视频内容
+router.post('/:id/profile-sync', async (req, res) => {
+  try {
+    const accountId = req.params.id;
+    const accounts = await database.getAllAccounts();
+    const account = accounts.find(a => a.id === accountId);
+
+    if (!account) {
+      return res.status(404).json({ code: 404, message: '账号不存在' });
+    }
+
+    const result = await fetchAccountProfileOnly(account);
+    if (!result.success) {
+      return res.status(result.status || 500).json({
+        code: result.status || 500,
+        message: result.message || '账号资料同步失败',
+        data: result.data || {}
+      });
+    }
+
+    const updates = buildAccountProfileUpdates(result.profileData, account.platform_code);
+    await database.updateAccount(accountId, updates);
+    const updatedAccount = (await database.getAllAccounts()).find(a => a.id === accountId);
+
+    res.json({
+      code: 0,
+      message: '账号资料同步成功',
+      data: {
+        profileUpdated: true,
+        account: updatedAccount,
+        profileData: result.profileData || null
+      }
+    });
   } catch (error) {
     res.status(500).json({ code: 500, message: error.message });
   }
@@ -1488,6 +1567,100 @@ function normalizeGlobalCookiePlatform(platform = 'douyin') {
 
 function getGlobalCookieId(platform = 'douyin') {
   return GLOBAL_COOKIE_PLATFORM_IDS[normalizeGlobalCookiePlatform(platform)];
+}
+
+async function getParsedCookieForPlatform(platform) {
+  const globalCookie = await getGlobalCookie(platform);
+  if (!globalCookie || !globalCookie.cookieData) return null;
+  try {
+    return JSON.parse(globalCookie.cookieData);
+  } catch (e) {
+    await invalidateGlobalCookie(platform);
+    return null;
+  }
+}
+
+function buildAccountProfileUpdates(profileData, platformCode) {
+  const updates = { last_fetch_at: new Date().toISOString() };
+  if (!profileData) return updates;
+  if (profileData.avatar) updates.avatar = profileData.avatar;
+  if (profileData.nickname) updates.nickname = profileData.nickname;
+  if (profileData.signature) updates.signature = profileData.signature;
+  if (platformCode !== 'videohao') {
+    if (profileData.follower_count !== undefined) updates.follower_count = profileData.follower_count;
+    if (profileData.following_count !== undefined) updates.following_count = profileData.following_count;
+    if (profileData.like_count !== undefined) updates.like_count = profileData.like_count;
+  }
+  if (profileData.video_count !== undefined) updates.video_count = profileData.video_count;
+  return updates;
+}
+
+async function fetchAccountProfileOnly(account) {
+  const platform = account.platform_code;
+  if (platform === 'douyin') {
+    let cookies = null;
+    if (account.cookie_data) {
+      try { cookies = JSON.parse(account.cookie_data); } catch (e) {}
+    }
+    if (!cookies) {
+      cookies = await getParsedCookieForPlatform('douyin');
+    }
+    if (!cookies) {
+      return { success: false, status: 401, message: '请先扫码获取抖音全局Cookie', data: { needRelogin: true } };
+    }
+    const userPath = account.sec_uid || account.unique_id;
+    const result = await scraper.fetchWithCookies(userPath, cookies);
+    if (result.cookieExpired) {
+      await invalidateGlobalCookie('douyin');
+      return { success: false, status: 401, message: '抖音Cookie已失效，请重新扫码登录', data: { needRelogin: true } };
+    }
+    return result.success
+      ? { success: true, profileData: result.data }
+      : { success: false, status: 502, message: result.error || '抖音账号资料同步失败' };
+  }
+
+  if (platform === 'xiaohongshu') {
+    let cookies = null;
+    if (account.cookie_data) {
+      try { cookies = JSON.parse(account.cookie_data); } catch (e) {}
+    }
+    if (!cookies) {
+      cookies = await getParsedCookieForPlatform('xiaohongshu');
+    }
+    if (!cookies) {
+      return { success: false, status: 401, message: '请先扫码获取小红书全局Cookie', data: { needRelogin: true } };
+    }
+    const url = `https://www.xiaohongshu.com/user/profile/${account.unique_id}`;
+    const result = await xhsScraper.fetchFromLink(url, cookies, { useCreatorProfile: account.status === 'active' });
+    if (result.cookieExpired) {
+      await invalidateGlobalCookie('xiaohongshu');
+      return { success: false, status: 401, message: '小红书Cookie已失效，请重新扫码登录', data: { needRelogin: true } };
+    }
+    return result.success
+      ? { success: true, profileData: result.data }
+      : { success: false, status: result.rateLimited ? 429 : 502, message: result.error || '小红书账号资料同步失败' };
+  }
+
+  if (platform === 'videohao') {
+    if (account.status === 'public') {
+      const result = await videohaoLocalProxy.resolvePublicAccountByDesktopWeChat(account.nickname || account.unique_id, {
+        timeout: 25000
+      });
+      return result.success
+        ? { success: true, profileData: result.data || {} }
+        : { success: false, status: 502, message: result.error || '视频号账号资料同步失败' };
+    }
+    const authState = account.cookie_data ? (() => { try { return JSON.parse(account.cookie_data); } catch (e) { return null; } })() : null;
+    const result = await videohaoScraper.fetchProfileAndPosts(account.sec_uid || account.unique_id, authState, 0, null, null, {});
+    if (result.cookieExpired) {
+      return { success: false, status: 401, message: '视频号授权已失效，请重新扫码登录', data: { needRelogin: true } };
+    }
+    return result.success
+      ? { success: true, profileData: result.data?.profile || {} }
+      : { success: false, status: 502, message: result.error || '视频号账号资料同步失败' };
+  }
+
+  return { success: false, status: 400, message: '暂不支持该平台资料同步' };
 }
 
 // 获取全局Cookie状态

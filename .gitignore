@@ -36,6 +36,7 @@ server/delete_video.js
 server/restore_video.js
 server/test_proxy_scrape.js
 server/wx_*.py
+!server/wx_auto_open_videohao.py
 server/wechat_*.py
 server/fix_*.py
 server/src/*.py

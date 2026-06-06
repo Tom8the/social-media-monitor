@@ -174,7 +174,7 @@ class XiaohongshuScraper {
     return this.context;
   }
 
-  async fetchFromLink(url, cookies = null) {
+  async fetchFromLink(url, cookies = null, options = {}) {
     const context = await this.createContext(cookies);
     const page = await context.newPage();
 
@@ -195,7 +195,8 @@ class XiaohongshuScraper {
 
       const userIdFromUrl = this._extractUserId(page.url()) || this._extractUserId(url);
       const profile = await this._extractProfileFromPage(page, userIdFromUrl);
-      const creatorSnapshot = Array.isArray(cookies) && cookies.length > 0
+      const useCreatorProfile = options.useCreatorProfile !== false;
+      const creatorSnapshot = useCreatorProfile && Array.isArray(cookies) && cookies.length > 0
         ? await this._fetchCreatorSnapshot(context, userIdFromUrl).catch(() => null)
         : null;
       if (creatorSnapshot?.profile && (!userIdFromUrl || creatorSnapshot.profile.unique_id === userIdFromUrl)) {
@@ -208,6 +209,20 @@ class XiaohongshuScraper {
           following_count: creatorSnapshot.profile.following_count || profile.following_count || 0,
           like_count: creatorSnapshot.profile.like_count || profile.like_count || 0
         });
+      }
+      const isPublicLinkImport = options.useCreatorProfile === false;
+      const profileMatchesTarget = !userIdFromUrl || !profile.unique_id || profile.unique_id === userIdFromUrl;
+      if (isPublicLinkImport) {
+        if (!profileMatchesTarget) {
+          profile.unique_id = userIdFromUrl || profile.unique_id;
+          profile.follower_count = 0;
+          profile.following_count = 0;
+          profile.like_count = 0;
+        } else if (!userIdFromUrl) {
+          profile.follower_count = 0;
+          profile.following_count = 0;
+          profile.like_count = 0;
+        }
       }
       await page.close().catch(() => {});
 
@@ -233,6 +248,87 @@ class XiaohongshuScraper {
     } catch (error) {
       await page.close().catch(() => {});
       return { success: false, error: error.message };
+    }
+  }
+
+  async fetchFromKeyword(keyword, cookies = null, options = {}) {
+    const query = String(keyword || '').trim();
+    if (!query) {
+      return { success: false, error: '请输入小红书账号名称' };
+    }
+
+    const context = await this.createContext(cookies);
+    const page = await context.newPage();
+    const apiCandidates = [];
+
+    try {
+      page.on('response', async (response) => {
+        const url = response.url();
+        if (!url.includes('xiaohongshu.com/api/sns/web/v1/search/notes')) return;
+        try {
+          const data = await response.json();
+          apiCandidates.push(...this._parseSearchNoteUserCandidates(data, query));
+        } catch (e) {}
+      });
+
+      await this._beforeRequest();
+      const searchUrl = `https://www.xiaohongshu.com/search_result?keyword=${encodeURIComponent(query)}`;
+      this._log('search:keyword:start', { keyword: query });
+      await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(8000);
+
+      const pageState = await this._getPageState(page);
+      if (pageState === 'login') {
+        await page.close().catch(() => {});
+        return { success: false, error: '小红书Cookie需要重新扫码验证', cookieExpired: true };
+      }
+      if (pageState === 'blocked') {
+        await page.close().catch(() => {});
+        return { success: false, error: '小红书触发安全验证，请稍后再试', rateLimited: true };
+      }
+
+      const domCandidates = await this._extractSearchUserCandidatesFromPage(page, query);
+      const candidate = this._pickBestSearchUserCandidate([...apiCandidates, ...domCandidates], query);
+      await page.close().catch(() => {});
+
+      if (!candidate?.url) {
+        return { success: false, error: `未搜索到匹配的小红书账号：${query}` };
+      }
+
+      this._log('search:keyword:matched', {
+        keyword: query,
+        nickname: candidate.nickname,
+        userId: candidate.user_id
+      });
+
+      const result = await this.fetchFromLink(candidate.url, cookies, {
+        ...options,
+        useCreatorProfile: false
+      });
+      if (!result.success) {
+        if (candidate.user_id && candidate.nickname) {
+          return {
+            success: true,
+            data: this._buildProfileFromSearchCandidate(candidate, query)
+          };
+        }
+        return result;
+      }
+
+      return {
+        success: true,
+        data: {
+          ...result.data,
+          unique_id: result.data.unique_id || candidate.user_id,
+          user_path: result.data.user_path || candidate.user_id || null,
+          nickname: result.data.nickname || candidate.nickname || query,
+          avatar: result.data.avatar || candidate.avatar || '',
+          search_keyword: query
+        }
+      };
+    } catch (error) {
+      await page.close().catch(() => {});
+      return { success: false, error: this._normalizeNavigationError(error) };
     }
   }
 
@@ -670,8 +766,8 @@ class XiaohongshuScraper {
         }
 
         const notes = flatNotes.map((item) => {
-          const card = item.noteCard || item;
-          const interact = card.interactInfo || {};
+          const card = item.noteCard || item.note_card || item;
+          const interact = card.interactInfo || card.interact_info || card.interaction || item.interactInfo || item.interact_info || {};
           const cover = card.cover || card.coverInfo || {};
           const video = card.video || {};
           const stream = video.media?.stream || {};
@@ -692,10 +788,10 @@ class XiaohongshuScraper {
               card.viewCount, card.view_count, card.readCount, card.read_count, card.browseCount,
               card.playCount, card.play_count, domPlayCounts[noteId]
             )),
-            like_count: parseCount(firstPresent(interact.likedCount, interact.liked_count, interact.likeCount, interact.like_count, card.likeCount, card.like_count)),
-            comment_count: parseCount(firstPresent(interact.commentCount, interact.comment_count, interact.comments, card.commentCount, card.comment_count)),
-            collect_count: parseCount(firstPresent(interact.collectedCount, interact.collected_count, interact.collectCount, interact.collect_count, interact.favCount, card.collectCount, card.collect_count)),
-            share_count: parseCount(firstPresent(interact.sharedCount, interact.shared_count, interact.shareCount, interact.share_count, card.shareCount, card.share_count)),
+            like_count: parseCount(firstPresent(interact.likedCount, interact.liked_count, interact.likeCount, interact.like_count, interact.likes, interact.liked, interact.likeNum, interact.like_num, card.likedCount, card.liked_count, card.likeCount, card.like_count, card.likes, card.liked)),
+            comment_count: parseCount(firstPresent(interact.commentCount, interact.comment_count, interact.comments, interact.commentsCount, interact.commentNum, interact.comment_num, card.commentCount, card.comment_count, card.comments, card.commentsCount, card.commentNum, card.comment_num)),
+            collect_count: parseCount(firstPresent(interact.collectedCount, interact.collected_count, interact.collectCount, interact.collect_count, interact.collectionCount, interact.collection_count, interact.favCount, interact.fav_count, interact.favoriteCount, interact.favorite_count, card.collectedCount, card.collected_count, card.collectCount, card.collect_count, card.collectionCount, card.collection_count, card.favCount, card.fav_count, card.favoriteCount, card.favorite_count)),
+            share_count: parseCount(firstPresent(interact.sharedCount, interact.shared_count, interact.shareCount, interact.share_count, interact.shares, interact.shareNum, interact.share_num, card.sharedCount, card.shared_count, card.shareCount, card.share_count, card.shares, card.shareNum, card.share_num)),
           publish_time: card.publishTime || card.time || card.createTime || null,
           xsec_token: card.xsecToken || card.xsec_token || item.xsecToken || '',
           image_count: Array.isArray(card.imageList || card.images) ? (card.imageList || card.images).length : 0
@@ -990,9 +1086,10 @@ class XiaohongshuScraper {
 
         const detail = await this._extractCurrentNoteDetail(page, note.note_id);
         if (detail) {
+          const countKeys = new Set(['play_count', 'like_count', 'comment_count', 'collect_count', 'share_count']);
           const detailEntries = Object.entries(detail).filter(([key, value]) => {
             if (value === undefined || value === null || value === '') return false;
-            if (key === 'play_count' && Number(value) === 0 && Number(note.play_count) > 0) return false;
+            if (countKeys.has(key) && Number(value) === 0 && Number(note[key]) > 0) return false;
             return true;
           });
           enriched[index] = {
@@ -1080,6 +1177,36 @@ class XiaohongshuScraper {
         return 0;
       };
 
+      const readDomActionCounts = () => {
+        const result = {};
+        const parseLooseCount = (text) => {
+          const match = String(text || '').match(/(\d+(?:\.\d+)?\s*[\u4e07\u5104\u5343wWkK]?)/);
+          return match ? parseCount(match[1]) : 0;
+        };
+        const keywordMap = [
+          ['like_count', ['like', 'liked', '\u8d5e', '\u70b9\u8d5e']],
+          ['comment_count', ['comment', '\u8bc4\u8bba']],
+          ['collect_count', ['collect', 'favorite', 'fav', '\u6536\u85cf']],
+          ['share_count', ['share', '\u5206\u4eab', '\u8f6c\u53d1']]
+        ];
+        Array.from(document.querySelectorAll('button, [role="button"], [class], [aria-label], [title]')).forEach((el) => {
+          const countText = [
+            el.getAttribute('aria-label'),
+            el.getAttribute('title'),
+            el.textContent
+          ].map((value) => String(value || '')).join(' ');
+          const text = `${countText} ${String(el.className || '')}`;
+          const lower = text.toLowerCase();
+          for (const [key, keywords] of keywordMap) {
+            if (result[key]) continue;
+            if (!keywords.some((keyword) => lower.includes(keyword.toLowerCase()))) continue;
+            const value = parseLooseCount(countText);
+            if (value > 0) result[key] = value;
+          }
+        });
+        return result;
+      };
+
       const candidates = [];
       const pushCandidate = (value) => {
         const unwrapped = unwrap(value);
@@ -1138,7 +1265,8 @@ class XiaohongshuScraper {
         return domPublishTime ? { note_id: noteId, publish_time: domPublishTime } : null;
       }
 
-      const interact = note.interactInfo || note.interaction || {};
+      const interact = note.interactInfo || note.interact_info || note.interaction || note.interactionInfo || {};
+      const domActionCounts = readDomActionCounts();
       const imageList = note.imageList || note.imagesList || note.images_list || note.images || note.image_list || [];
       const imageUrls = Array.isArray(imageList)
         ? imageList.map((image) => {
@@ -1172,10 +1300,10 @@ class XiaohongshuScraper {
           note.viewCount, note.view_count, note.readCount, note.read_count, note.browseCount,
           note.playCount, note.play_count, readDomPlayCount()
         )),
-        like_count: parseCount(firstPresent(interact.likedCount, interact.liked_count, interact.likeCount, interact.like_count, note.likedCount, note.likeCount, note.like_count)),
-        comment_count: parseCount(firstPresent(interact.commentCount, interact.comment_count, interact.comments, note.commentCount, note.comment_count)),
-        collect_count: parseCount(firstPresent(interact.collectedCount, interact.collected_count, interact.collectCount, interact.collect_count, interact.favCount, note.collectedCount, note.collectCount, note.collect_count, note.favCount)),
-        share_count: parseCount(firstPresent(interact.sharedCount, interact.shared_count, interact.shareCount, interact.share_count, note.sharedCount, note.shareCount, note.share_count)),
+        like_count: parseCount(firstPresent(interact.likedCount, interact.liked_count, interact.likeCount, interact.like_count, interact.likes, interact.liked, interact.likeNum, interact.like_num, note.likedCount, note.liked_count, note.likeCount, note.like_count, note.likes, note.liked, domActionCounts.like_count)),
+        comment_count: parseCount(firstPresent(interact.commentCount, interact.comment_count, interact.comments, interact.commentsCount, interact.commentNum, interact.comment_num, note.commentCount, note.comment_count, note.comments, note.commentsCount, note.commentNum, note.comment_num, domActionCounts.comment_count)),
+        collect_count: parseCount(firstPresent(interact.collectedCount, interact.collected_count, interact.collectCount, interact.collect_count, interact.collectionCount, interact.collection_count, interact.favCount, interact.fav_count, interact.favoriteCount, interact.favorite_count, note.collectedCount, note.collected_count, note.collectCount, note.collect_count, note.collectionCount, note.collection_count, note.favCount, note.fav_count, note.favoriteCount, note.favorite_count, domActionCounts.collect_count)),
+        share_count: parseCount(firstPresent(interact.sharedCount, interact.shared_count, interact.shareCount, interact.share_count, interact.shares, interact.shareNum, interact.share_num, note.sharedCount, note.shared_count, note.shareCount, note.share_count, note.shares, note.shareNum, note.share_num, domActionCounts.share_count)),
         publish_time: note.time || note.publishTime || note.createTime || note.createdTime || note.publish_time ||
           note.publish_time_millis || note.timestamp || note.create_time || domPublishTime || null
       };
@@ -1263,6 +1391,135 @@ class XiaohongshuScraper {
       }));
   }
 
+  _normalizeSearchText(value) {
+    return String(value || '').replace(/\s+/g, '').trim().toLowerCase();
+  }
+
+  _parseSearchNoteUserCandidates(response, keyword) {
+    const items = response?.data?.items;
+    if (!Array.isArray(items)) return [];
+
+    return items
+      .map((item) => {
+        const user = item?.note_card?.user || item?.user || item?.noteCard?.user;
+        const userId = user?.user_id || user?.userId || user?.id;
+        const nickname = user?.nickname || user?.nick_name || user?.name || '';
+        if (!userId || !nickname) return null;
+        return {
+          user_id: userId,
+          nickname,
+          avatar: user.avatar || user.image || user.imageb || '',
+          xsec_token: user.xsec_token || '',
+          url: this._buildXhsProfileUrl(userId, user.xsec_token),
+          source: 'search_notes_api',
+          score: this._scoreSearchUserCandidate({ nickname, user_id: userId }, keyword)
+        };
+      })
+      .filter(Boolean);
+  }
+
+  async _extractSearchUserCandidatesFromPage(page, keyword) {
+    try {
+      const candidates = await page.evaluate((kw) => {
+        const normalize = value => String(value || '').replace(/\s+/g, '').trim().toLowerCase();
+        const expected = normalize(kw);
+        const extractUserId = href => {
+          const match = String(href || '').match(/\/user\/profile\/([A-Za-z0-9_-]+)/);
+          return match ? match[1] : '';
+        };
+        const score = item => {
+          const nickname = normalize(item.nickname);
+          const text = normalize(item.text);
+          if (nickname === expected) return 100;
+          if (nickname && expected && nickname.includes(expected)) return 80;
+          if (nickname && expected && expected.includes(nickname)) return 60;
+          if (text && expected && text.includes(expected)) return 30;
+          return 5;
+        };
+
+        return Array.from(document.querySelectorAll('a[href*="/user/profile/"]'))
+          .map(link => {
+            const href = link.href || link.getAttribute('href') || '';
+            const userId = extractUserId(href);
+            const text = (link.innerText || link.textContent || '').trim();
+            const nickname = text.split('\n').map(s => s.trim()).find(Boolean) || '';
+            const img = link.querySelector('img[src]') || link.closest('div')?.querySelector('img[src]');
+            return {
+              user_id: userId,
+              nickname,
+              text,
+              avatar: img?.src || '',
+              url: href,
+              source: 'search_dom'
+            };
+          })
+          .filter(item => item.user_id && item.nickname && item.nickname !== '我')
+          .map(item => ({ ...item, score: score(item) }));
+      }, keyword);
+
+      return candidates;
+    } catch (error) {
+      this._log('search:dom_extract_failed', { message: error.message });
+      return [];
+    }
+  }
+
+  _scoreSearchUserCandidate(candidate, keyword) {
+    const expected = this._normalizeSearchText(keyword);
+    const nickname = this._normalizeSearchText(candidate?.nickname);
+    const text = this._normalizeSearchText(candidate?.text);
+    if (!expected || !nickname) return 0;
+    if (nickname === expected) return 100;
+    if (nickname.includes(expected)) return 80;
+    if (expected.includes(nickname)) return 60;
+    if (text.includes(expected)) return 30;
+    return 5;
+  }
+
+  _pickBestSearchUserCandidate(candidates, keyword) {
+    const seen = new Set();
+    const unique = candidates
+      .filter(item => item?.user_id && item?.nickname)
+      .map(item => ({
+        ...item,
+        score: Number.isFinite(item.score) ? item.score : this._scoreSearchUserCandidate(item, keyword),
+        url: item.url || this._buildXhsProfileUrl(item.user_id, item.xsec_token)
+      }))
+      .filter(item => {
+        if (seen.has(item.user_id)) return false;
+        seen.add(item.user_id);
+        return true;
+      });
+
+    unique.sort((a, b) => b.score - a.score);
+    const best = unique[0] || null;
+    return best && best.score >= 60 ? best : null;
+  }
+
+  _buildXhsProfileUrl(userId, xsecToken = '') {
+    const url = new URL(`https://www.xiaohongshu.com/user/profile/${userId}`);
+    if (xsecToken) {
+      url.searchParams.set('xsec_token', xsecToken);
+      url.searchParams.set('xsec_source', 'pc_search');
+    }
+    return url.toString();
+  }
+
+  _buildProfileFromSearchCandidate(candidate, keyword) {
+    return {
+      unique_id: candidate.user_id || `xhs_${Date.now()}`,
+      user_path: candidate.user_id || null,
+      nickname: candidate.nickname || keyword,
+      avatar: candidate.avatar || '',
+      signature: '',
+      follower_count: 0,
+      following_count: 0,
+      like_count: 0,
+      verified: 0,
+      search_keyword: keyword
+    };
+  }
+
   _extractUserId(url) {
     if (!url) return null;
     const match = url.match(/\/user\/profile\/([A-Za-z0-9_-]+)/);
@@ -1348,10 +1605,55 @@ class XiaohongshuScraper {
         }
         return 0;
       };
+      const normalizeImageUrl = (value) => {
+        if (!value || typeof value !== 'string') return '';
+        let raw = value.trim();
+        const bgMatch = raw.match(/url\(["']?([^"')]+)["']?\)/i);
+        if (bgMatch) raw = bgMatch[1];
+        raw = raw.replace(/\\u002F/g, '/').replace(/&amp;/g, '&');
+        if (raw.startsWith('//')) raw = `https:${raw}`;
+        return raw;
+      };
+      const isLikelyAvatarUrl = (value) => {
+        const raw = normalizeImageUrl(value);
+        if (!raw || raw.startsWith('data:')) return false;
+        const lower = raw.toLowerCase();
+        return lower.includes('avatar') ||
+          lower.includes('sns-avatar') ||
+          lower.includes('head') ||
+          lower.includes('portrait') ||
+          lower.includes('user') ||
+          lower.includes('xhscdn');
+      };
+      const readDomAvatar = () => {
+        const selectors = [
+          '[class*="avatar"] img',
+          'img[class*="avatar"]',
+          '[class*="user"] img',
+          '[class*="profile"] img',
+          'meta[property="og:image"]',
+          'meta[name="og:image"]',
+          'meta[name="twitter:image"]'
+        ];
+        for (const selector of selectors) {
+          for (const el of Array.from(document.querySelectorAll(selector))) {
+            const candidate = normalizeImageUrl(
+              el.getAttribute('content') ||
+              el.getAttribute('src') ||
+              el.getAttribute('data-src') ||
+              el.getAttribute('data-original') ||
+              el.style?.backgroundImage ||
+              ''
+            );
+            if (isLikelyAvatarUrl(candidate)) return candidate;
+          }
+        }
+        return '';
+      };
       return {
         unique_id: basic.userId || basic.user_id || basic.redId || userId,
         nickname: basic.nickname || basic.nickName || document.title.replace(/-?\s*小红书.*/, '').trim(),
-        avatar: extractAvatarCandidate(basic, userPageData, state) || '',
+        avatar: extractAvatarCandidate(basic, userPageData, state) || readDomAvatar() || '',
         signature: basic.desc || basic.description || '',
         follower_count: getInteraction(['粉丝', 'fans', 'follower']) ||
           countField(['fans', 'fansCount', 'fanCount', 'followerCount', 'followers', 'follower_count']),

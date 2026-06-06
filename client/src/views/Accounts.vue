@@ -148,7 +148,7 @@
           <div class="card-data-panel" style="background:#F8FAFC;border:1px solid #F1F5F9;padding:12px;margin-bottom:16px;">
             <div style="display:flex;justify-content:space-between;align-items:center;width:100%;box-sizing:border-box;">
               <span style="color:#64748B;font-weight:700;flex-shrink:0;font-size:12px;">总粉丝量</span>
-              <span :style="{fontWeight:'700',color:'#0F172A',textAlign:'right',flex:'1',minWidth:0,fontFamily:fontFamily}" class="font-cyber">{{ formatNumber(account.follower_count) }}</span>
+              <span :style="{fontWeight:'700',color:'#0F172A',textAlign:'right',flex:'1',minWidth:0,fontFamily:fontFamily}" class="font-cyber">{{ formatFollowerCount(account) }}</span>
             </div>
             <div style="display:flex;justify-content:space-between;align-items:center;width:100%;box-sizing:border-box;margin-top:8px;">
               <span style="color:#64748B;font-weight:700;flex-shrink:0;font-size:12px;">节点状态</span>
@@ -537,6 +537,11 @@ const formatNumber = (num) => {
   return num.toLocaleString()
 }
 
+const formatFollowerCount = (account) => {
+  if ((account.platform_code || account.platform) === 'videohao') return '-'
+  return formatNumber(account.follower_count)
+}
+
 const formatSyncTime = (time) => {
   if (!time) return '--'
   const date = new Date(time)
@@ -560,16 +565,16 @@ const getPlatformName = (p) => ({ douyin: '抖音', xiaohongshu: '小红书', vi
 const getPlatColor = (p) => ({ douyin: '#a855f7', xiaohongshu: '#FF2442', videohao: '#07C160' }[p] || '#00f0ff')
 const getShareUrlPlaceholder = () => {
   if (selectedPlatform.value === 'xiaohongshu') {
-    return '粘贴小红书主页或分享链接，例如：https://www.xiaohongshu.com/user/profile/xxxxx'
+    return '粘贴小红书主页链接，或直接输入账号名称'
   }
   if (selectedPlatform.value === 'videohao') {
     return '输入视频号名称或视频号ID，例如：人民日报'
   }
-  return '粘贴抖音分享链接，例如：https://www.douyin.com/user/xxxxx'
+  return '粘贴抖音分享链接，或直接输入账号名称'
 }
 const getShareUrlHint = () => {
   if (selectedPlatform.value === 'xiaohongshu') {
-    return '支持格式：小红书主页链接、分享卡片链接'
+    return '支持格式：小红书主页链接、分享卡片链接、账号名称'
   }
   if (selectedPlatform.value === 'videohao') {
     return '需要桌面微信保持登录；系统会通过微信搜一搜解析账号并获取 finder_username'
@@ -906,14 +911,15 @@ const fetchFromUrl = async (skipCookieCheck = false) => {
       ElMessage.error(res.message || '采集失败') 
     }
   } catch (e) {
-    if (selectedPlatform.value === 'xiaohongshu' && e.response?.data?.data?.needGlobalCookie) {
+    if (e.response?.data?.data?.needGlobalCookie) {
+      const cookiePlatform = e.response.data.data.platform || selectedPlatform.value
       globalCookieStates.value = {
         ...globalCookieStates.value,
-        xiaohongshu: { hasCookie: false, platform: 'xiaohongshu', updatedAt: null, isValid: false }
+        [cookiePlatform]: { hasCookie: false, platform: cookiePlatform, updatedAt: null, isValid: false }
       }
-      ElMessage.warning(e.response?.data?.message || '请先扫码获取小红书全局Cookie')
+      ElMessage.warning(e.response?.data?.message || `请先扫码获取${getPlatformName(cookiePlatform)}全局Cookie`)
       pendingGlobalCookieAction.value = () => fetchFromUrl(true)
-      startGlobalCookieLogin('xiaohongshu')
+      startGlobalCookieLogin(cookiePlatform)
       return
     }
     const msg = e.code === 'ECONNABORTED' ? '采集超时，请稍后重试（可能需要15-20秒）' : (e.response?.data?.message || '采集失败，请检查链接格式')
@@ -1056,24 +1062,19 @@ const resetQRCode = () => {
 }
 
 const handleSync = async (account) => {
-  if (account.platform === 'videohao' && account.status === 'public') {
-    await startVideohaoLocalCapture(account)
-    return
-  }
   account.syncing = true
   try {
-    ElMessage.info(`正在同步 ${account.nickname}...`)
-    const res = await accountApi.sync(account.id)
+    ElMessage.info(`正在更新 ${account.nickname} 的账号资料...`)
+    const res = await accountApi.profileSync(account.id)
     if (res.code === 0) {
-      ElMessage.success(`同步成功！新增 ${res.data?.addedCount || 0} 个视频`)
-      // 更新本地同步时间
+      ElMessage.success('账号资料已更新')
       account.last_fetch_at = new Date().toISOString()
       loadAccounts()
     } else {
-      ElMessage.error(res.message || '同步失败')
+      ElMessage.error(res.message || '账号资料更新失败')
     }
   } catch (e) {
-    ElMessage.error('同步失败：' + (e.response?.data?.message || e.message))
+    ElMessage.error('账号资料更新失败：' + (e.response?.data?.message || e.message))
   } finally {
     account.syncing = false
   }
@@ -1091,7 +1092,7 @@ const startVideohaoLocalCapture = async (account) => {
     const saved = Number(res.data?.saved) || 0
     account.last_fetch_at = new Date().toISOString()
     await loadAccounts()
-    ElMessage.success(saved > 0 ? `视频号桌面微信采集完成，新增/更新 ${saved} 条数据` : '视频号桌面微信采集完成，暂无新增数据')
+    ElMessage.success(saved > 0 ? `视频号桌面微信采集完成，账号资料已同步，新增/更新 ${saved} 条数据` : '视频号桌面微信采集完成，账号资料已同步，暂无新增数据')
   } catch (e) {
     ElMessage.error('视频号桌面微信采集失败：' + (e.response?.data?.message || e.message))
   } finally {

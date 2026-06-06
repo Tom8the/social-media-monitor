@@ -32,6 +32,7 @@ export const accountApi = {
   create: (data) => api.post('/accounts', data),
   update: (id, data) => api.put(`/accounts/${id}`, data),
   delete: (id) => api.delete(`/accounts/${id}`),
+  profileSync: (id) => api.post(`/accounts/${id}/profile-sync`, {}, { timeout: 120000 }),
   sync: (id, params = {}) => api.post(`/accounts/${id}/sync`, params, { timeout: 900000 }),
   // 批量采集（带限流）
   batchSync: (data) => api.post('/accounts/batch-sync', data, { timeout: 900000 }),
@@ -55,7 +56,7 @@ export const accountApi = {
   disableVideohaoSystemProxy: () => api.post('/videohao-local-proxy/disable-system-proxy'),
   getVideohaoLocalProxyStatus: () => api.get('/videohao-local-proxy/status'),
   // 真实数据采集（采集耗时较长，需要更长的超时时间）
-  fetchFromUrl: (data) => api.post('/accounts/fetch-from-url', data, { timeout: 60000 }),
+  fetchFromUrl: (data) => api.post('/accounts/fetch-from-url', data, { timeout: 300000 }),
   fetchBySecUid: (data) => api.post('/accounts/fetch-by-secuid', data, { timeout: 60000 })
 }
 

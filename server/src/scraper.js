@@ -1,5 +1,6 @@
 // 抖音数据采集服务 - 使用浏览器自动化
 const { chromium } = require('playwright');
+const path = require('path');
 
 class DouyinScraper {
   constructor() {
@@ -73,6 +74,28 @@ class DouyinScraper {
       }
       
       const page = await context.newPage();
+
+      let userApiData = null;
+      page.on('response', async (response) => {
+        const respUrl = response.url();
+        if (respUrl.includes('/user/') ||
+            respUrl.includes('aweme/v1/web/user') ||
+            respUrl.includes('aweme/v1/user') ||
+            respUrl.includes('account/info') ||
+            respUrl.includes('user/profile') ||
+            (respUrl.includes('/api/') && respUrl.includes('user'))) {
+          try {
+            const apiData = await response.json();
+            const hasUserData = apiData?.user || apiData?.user_info || apiData?.author ||
+              apiData?.data?.user || apiData?.data?.author ||
+              apiData?.user_list?.[0]?.user;
+            if (hasUserData && !userApiData) {
+              userApiData = apiData;
+              console.log('[Scraper] Cookie模式捕获到用户资料API:', respUrl.substring(0, 100));
+            }
+          } catch (e) {}
+        }
+      });
       
       // 反检测脚本
       await context.addInitScript(() => {
@@ -85,6 +108,7 @@ class DouyinScraper {
       
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.waitForTimeout(5000);
+      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
       
       // 检测Cookie是否失效：检查是否跳转到登录页或显示登录提示
       const cookieExpired = await this._checkCookieExpired(page);
@@ -96,6 +120,18 @@ class DouyinScraper {
       
       // 提取数据
       const data = await this._getDataFromDOM(page);
+      if (userApiData) {
+        const apiProfile = this._extractFromApiResponse(userApiData);
+        if (apiProfile) {
+          data.avatar = apiProfile.avatar || data.avatar;
+          data.follower_count = apiProfile.follower_count || data.follower_count || 0;
+          data.following_count = apiProfile.following_count || data.following_count || 0;
+          data.like_count = apiProfile.like_count || data.like_count || 0;
+          data.signature = apiProfile.signature || data.signature || '';
+          data.verified = apiProfile.verified || data.verified || 0;
+          data.nickname = apiProfile.nickname || data.nickname;
+        }
+      }
       
       await context.close();
       return { success: true, data, cookieExpired: false };
@@ -178,8 +214,346 @@ class DouyinScraper {
   }
 
   // ========== 核心方法：从任意链接获取用户信息 ==========
-  async fetchFromLink(url) {
+  async fetchFromKeyword(keyword, cookies = null) {
+    const query = String(keyword || '').trim();
+    if (!query) {
+      return { success: false, error: '请输入抖音账号名称' };
+    }
+
+    let searchBrowser = null;
+    const searchSession = await this.createVisibleSearchContext();
+    searchBrowser = searchSession.browser;
+    const context = searchSession.context;
+    if (cookies && Array.isArray(cookies)) {
+      await context.addCookies(cookies.map(c => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain,
+        path: c.path || '/',
+        expires: c.expires
+      })));
+    }
+    const page = await context.newPage();
+
+    try {
+      let apiCandidate = null;
+      let verifyDetected = false;
+      page.on('response', async (response) => {
+        const responseUrl = response.url();
+        if (!responseUrl.includes('/aweme/v1/web/discover/search/')) return;
+        if (!responseUrl.includes('aweme_user') && !responseUrl.includes('search_channel=aweme_user_web')) return;
+
+        try {
+          const data = await response.json();
+          if (this._isDouyinSearchVerifyResponse(data)) {
+            verifyDetected = true;
+            console.log('[Scraper] 抖音搜索触发滑动验证，等待用户在弹出的 Chrome 窗口完成验证...');
+          }
+          const candidate = this._parseDouyinSearchApiCandidate(data, query);
+          if (candidate && !apiCandidate) {
+            apiCandidate = candidate;
+            console.log('[Scraper] 捕获到抖音搜索账号接口结果:', {
+              nickname: candidate.nickname,
+              user_path: candidate.user_path,
+              follower_count: candidate.follower_count
+            });
+          }
+        } catch (e) {}
+      });
+
+      const searchUrl = `https://www.douyin.com/search/${encodeURIComponent(query)}?type=user`;
+      console.log(`[Scraper] 正在搜索抖音账号: ${query}`);
+      await page.goto(searchUrl, {
+        waitUntil: 'domcontentloaded',
+        timeout: 30000
+      });
+      await page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() => {});
+
+      const startedAt = Date.now();
+      let maxWaitMs = 30000;
+      let lastVerifyLogAt = 0;
+      let reloadAfterVerifyAt = 0;
+      let domCandidate = null;
+      while (Date.now() - startedAt < maxWaitMs) {
+        domCandidate = await this._findUserLinkFromSearchPage(page, query);
+        if (domCandidate?.url) break;
+        if (apiCandidate?.url) break;
+        const pageVerifyDetected = await this._detectDouyinSearchVerification(page);
+        if (verifyDetected || pageVerifyDetected) {
+          verifyDetected = true;
+          maxWaitMs = 240000;
+          const now = Date.now();
+          if (now - lastVerifyLogAt > 15000) {
+            console.log('[Scraper] 请在弹出的抖音 Chrome 窗口完成滑动验证，验证完成后程序会继续搜索...');
+            lastVerifyLogAt = now;
+          }
+
+          if (!pageVerifyDetected && now - reloadAfterVerifyAt > 12000) {
+            reloadAfterVerifyAt = now;
+            await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+          }
+        }
+        await page.waitForTimeout(1000);
+      }
+
+      const candidate = domCandidate?.url ? { ...apiCandidate, ...domCandidate } : apiCandidate;
+      if (!candidate?.url) {
+        await searchBrowser.close();
+        if (verifyDetected) {
+          return { success: false, error: `抖音要求滑动验证，请在弹出的 Chrome 窗口完成验证后重试：${query}` };
+        }
+        return { success: false, error: `未搜索到匹配的抖音账号：${query}` };
+      }
+
+      await searchBrowser.close();
+      const profileResult = await this.fetchFromLink(candidate.url, cookies);
+      if (!profileResult.success) {
+        if (candidate.nickname && candidate.user_path) {
+          return {
+            success: true,
+            data: this._buildDouyinDataFromSearchCandidate(candidate, query)
+          };
+        }
+        return profileResult;
+      }
+      if (!profileResult.data?.nickname || profileResult.data.nickname === '未登录' || profileResult.data.unique_id === 'self') {
+        if (candidate.nickname && candidate.user_path) {
+          return {
+            success: true,
+            data: this._buildDouyinDataFromSearchCandidate(candidate, query)
+          };
+        }
+        return { success: false, error: `未搜索到可采集的抖音账号：${query}` };
+      }
+
+      return {
+        success: true,
+        data: {
+          ...profileResult.data,
+          nickname: profileResult.data.nickname || candidate.nickname || query,
+          avatar: profileResult.data.avatar || candidate.avatar || '',
+          unique_id: profileResult.data.unique_id || candidate.user_path || ('dy_' + Date.now()),
+          user_path: profileResult.data.user_path || candidate.user_path || null,
+          follower_count: profileResult.data.follower_count || candidate.follower_count || 0,
+          following_count: profileResult.data.following_count || candidate.following_count || 0,
+          like_count: profileResult.data.like_count || candidate.like_count || 0,
+          signature: profileResult.data.signature || candidate.signature || '',
+          verified: profileResult.data.verified || candidate.verified || 0,
+          search_keyword: query
+        }
+      };
+    } catch (error) {
+      console.error('[Scraper] 抖音账号搜索失败:', error.message);
+      if (searchBrowser) await searchBrowser.close().catch(() => {});
+      return { success: false, error: error.message };
+    }
+  }
+
+  async createVisibleSearchContext() {
+    const userDataDir = path.join(__dirname, '..', 'tmp', 'douyin-search-profile');
+    const context = await chromium.launchPersistentContext(userDataDir, {
+      channel: 'chrome',
+      headless: process.env.DOUYIN_SEARCH_HEADLESS === 'true',
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      viewport: { width: 1280, height: 900 },
+      locale: 'zh-CN',
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--disable-infobars',
+        '--no-first-run',
+        '--disable-dev-shm-usage',
+        '--window-size=1280,900',
+        '--mute-audio'
+      ]
+    });
+
+    await context.setExtraHTTPHeaders({
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+    });
+
+    await context.addInitScript(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => false });
+      window.chrome = { runtime: {} };
+      delete navigator.__proto__.webdriver;
+      Object.defineProperty(navigator.__proto__, 'webdriver', {
+        get: () => false,
+        configurable: true
+      });
+    });
+
+    return { browser: { close: () => context.close() }, context };
+  }
+
+  async _findUserLinkFromSearchPage(page, keyword) {
+    try {
+      return await page.evaluate((kw) => {
+        const normalize = value => String(value || '').replace(/\s+/g, '').trim().toLowerCase();
+        const expected = normalize(kw);
+        const absUrl = href => {
+          try { return new URL(href, location.origin).toString(); } catch { return ''; }
+        };
+        const userPathFromUrl = href => {
+          const match = String(href || '').match(/\/user\/([A-Za-z0-9_-]+)/);
+          return match ? match[1] : '';
+        };
+        const scoreCandidate = item => {
+          const text = normalize(`${item.nickname || ''} ${item.text || ''}`);
+          if (!text) return 0;
+          if (expected && text === expected) return 100;
+          if (expected && text.includes(expected)) return 80;
+          if (expected && expected.includes(text)) return 60;
+          return 10;
+        };
+
+        const candidates = [];
+        for (const link of Array.from(document.querySelectorAll('a[href*="/user/"]'))) {
+          const href = link.getAttribute('href') || link.href || '';
+          const userPath = userPathFromUrl(href);
+          if (!userPath) continue;
+          if (userPath === 'self' || href.includes('/user/self')) continue;
+          const card = link.closest('[class*="user"], [class*="card"], [class*="result"], li, div') || link;
+          const text = (card.innerText || link.innerText || '').trim();
+          const avatar = card.querySelector('img[src]')?.src || link.querySelector('img[src]')?.src || '';
+          const nickname = (link.innerText || text.split('\n')[0] || '').trim();
+          const url = absUrl(href);
+          if (url) {
+            candidates.push({ url, user_path: userPath, nickname, text, avatar });
+          }
+        }
+
+        const seen = new Set();
+        const unique = candidates.filter(item => {
+          if (seen.has(item.user_path)) return false;
+          seen.add(item.user_path);
+          return true;
+        });
+        unique.sort((a, b) => scoreCandidate(b) - scoreCandidate(a));
+        return unique[0] || null;
+      }, keyword);
+    } catch (error) {
+      console.log('[Scraper] 搜索页提取账号链接失败:', error.message);
+      return null;
+    }
+  }
+
+  _isDouyinSearchVerifyResponse(response) {
+    const nilInfo = response?.search_nil_info || response?.data?.search_nil_info;
+    const nilType = String(nilInfo?.search_nil_type || nilInfo?.search_nil_item || '').toLowerCase();
+    if (nilType.includes('verify')) return true;
+    const message = String(response?.status_msg || response?.message || response?.data?.message || '').toLowerCase();
+    return message.includes('verify') || message.includes('captcha') || message.includes('验证');
+  }
+
+  async _detectDouyinSearchVerification(page) {
+    try {
+      return await page.evaluate(() => {
+        const text = document.body?.innerText || '';
+        if (/滑动|拖动|验证码|安全验证|验证通过|verify|captcha/i.test(text)) return true;
+        const selectors = [
+          'iframe[src*="captcha"]',
+          'iframe[src*="verify"]',
+          '[class*="captcha"]',
+          '[class*="Captcha"]',
+          '[class*="verify"]',
+          '[class*="Verify"]',
+          '[id*="captcha"]',
+          '[id*="verify"]'
+        ];
+        return selectors.some(selector => document.querySelector(selector));
+      });
+    } catch (error) {
+      return false;
+    }
+  }
+
+  _parseDouyinSearchApiCandidate(response, keyword) {
+    if (!response) return null;
+
+    const normalize = value => String(value || '').replace(/\s+/g, '').trim().toLowerCase();
+    const expected = normalize(keyword);
+    const parseCount = value => {
+      if (value === null || value === undefined || value === '') return 0;
+      if (typeof value === 'number') return Math.floor(value);
+      const text = String(value).replace(/,/g, '').trim();
+      const match = text.match(/(\d+\.?\d*)/);
+      if (!match) return 0;
+      const num = parseFloat(match[1]);
+      if (text.includes('亿')) return Math.floor(num * 100000000);
+      if (text.includes('万') || /\d+w$/i.test(text)) return Math.floor(num * 10000);
+      if (text.includes('千') || /\d+k$/i.test(text)) return Math.floor(num * 1000);
+      return Math.floor(num);
+    };
+    const imageUrl = image => image?.url_list?.[0] || image?.uri || '';
+    const pickUser = item => item?.user_info || item?.user || item?.userInfo || item?.author || item;
+    const scoreUser = user => {
+      const nickname = normalize(user.nickname || user.userName || user.name);
+      const uniqueId = normalize(user.unique_id || user.uniqueId || user.short_id || user.shortId);
+      const signature = normalize(user.signature || user.desc);
+      let score = 0;
+      if (nickname === expected) score += 100;
+      else if (nickname.includes(expected)) score += 80;
+      else if (expected.includes(nickname)) score += 60;
+      if (uniqueId === expected) score += 70;
+      else if (uniqueId.includes(expected)) score += 35;
+      if (signature.includes(expected)) score += 5;
+      score += Math.min(20, Math.floor(parseCount(user.follower_count || user.followerCount) / 1000000));
+      return score;
+    };
+
+    const list = [
+      ...(Array.isArray(response.user_list) ? response.user_list : []),
+      ...(Array.isArray(response.data?.user_list) ? response.data.user_list : []),
+      ...(Array.isArray(response.users) ? response.users : []),
+      ...(Array.isArray(response.data?.users) ? response.data.users : [])
+    ].map(pickUser).filter(Boolean);
+
+    const candidates = list.map(user => {
+      const userPath = user.sec_uid || user.secUid || user.sec_uid_str || user.secUidStr || user.sec_id || '';
+      const fallbackPath = userPath || user.uid || user.unique_id || user.short_id || '';
+      return {
+        url: fallbackPath ? `https://www.douyin.com/user/${fallbackPath}` : '',
+        user_path: fallbackPath,
+        nickname: user.nickname || user.userName || user.name || '',
+        avatar: imageUrl(user.avatar_thumb) || imageUrl(user.avatar_medium) || imageUrl(user.avatar_larger) || user.avatar_url || user.avatar || '',
+        follower_count: parseCount(user.follower_count || user.followerCount),
+        following_count: parseCount(user.following_count || user.followingCount),
+        like_count: parseCount(user.total_favorited || user.liked_count || user.favorited_count || user.like_count),
+        signature: user.signature || user.desc || '',
+        verified: user.verified || user.is_star || user.custom_verify || user.enterprise_verify_reason ? 1 : 0,
+        score: scoreUser(user)
+      };
+    }).filter(item => item.url && item.nickname);
+
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates[0] || null;
+  }
+
+  _buildDouyinDataFromSearchCandidate(candidate, keyword) {
+    return {
+      unique_id: candidate.user_path || ('dy_' + Date.now()),
+      user_path: candidate.user_path || null,
+      nickname: candidate.nickname || keyword,
+      avatar: candidate.avatar || '',
+      follower_count: candidate.follower_count || 0,
+      following_count: candidate.following_count || 0,
+      like_count: candidate.like_count || 0,
+      signature: candidate.signature || '',
+      verified: candidate.verified || 0,
+      search_keyword: keyword
+    };
+  }
+
+  async fetchFromLink(url, cookies = null) {
     const context = await this.createContext();
+    if (cookies && Array.isArray(cookies)) {
+      await context.addCookies(cookies.map(c => ({
+        name: c.name,
+        value: c.value,
+        domain: c.domain,
+        path: c.path || '/',
+        expires: c.expires
+      })));
+    }
     const page = await context.newPage();
     
     try {
@@ -234,7 +608,7 @@ class DouyinScraper {
         
         // 尝试从 DOM 获取数据
         domData = await this._getDataFromDOM(page);
-        if (domData && domData.nickname && domData.follower_count > 1000) {
+        if (domData && domData.nickname && domData.follower_count > 0) {
           console.log('[Scraper] 从DOM获取到数据:', domData);
           
           // 获取 user_path
@@ -254,12 +628,16 @@ class DouyinScraper {
             avatar: data.avatar
           });
           
-          // 如果 DOM 数据缺少 avatar，尝试从 API 数据补充
-          if (!data.avatar && userApiData) {
+          // 用 API 数据补充/修正主页统计，避免 DOM 结构变化导致粉丝数不准
+          if (userApiData) {
             const apiData = this._extractFromApiResponse(userApiData);
-            if (apiData?.avatar) {
-              data.avatar = apiData.avatar;
-              console.log('[Scraper] 从 API 补充头像:', data.avatar);
+            if (apiData) {
+              data.avatar = apiData.avatar || data.avatar;
+              data.follower_count = apiData.follower_count || data.follower_count || 0;
+              data.following_count = apiData.following_count || data.following_count || 0;
+              data.like_count = apiData.like_count || data.like_count || 0;
+              data.signature = apiData.signature || data.signature || '';
+              data.verified = apiData.verified || data.verified || 0;
             }
           }
           
@@ -280,7 +658,7 @@ class DouyinScraper {
         const finalUrl = page.url();
         const userMatch = finalUrl.match(/\/user\/([a-zA-Z0-9_-]+)/);
         
-        if (userData && userData.nickname && userData.follower_count > 1000) {
+        if (userData && userData.nickname) {
           const data = {
             ...userData,
             user_path: userMatch ? userMatch[1] : null,
@@ -381,7 +759,7 @@ class DouyinScraper {
               const nextText = next.textContent?.trim();
               console.log(`[Scraper Debug] 下一个兄弟: "${nextText}"`);
               const val = parseCount(nextText);
-              if (val !== undefined && val > 0 && val < 100000000) {
+              if (val !== undefined && val > 0 && val < 10000000000) {
                 result[mapping[label]] = val;
                 console.log(`[Scraper Debug] 从下一个兄弟获取 ${mapping[label]}: ${val}`);
                 break;
@@ -394,7 +772,7 @@ class DouyinScraper {
               const prevText = prev.textContent?.trim();
               console.log(`[Scraper Debug] 上一个兄弟: "${prevText}"`);
               const val = parseCount(prevText);
-              if (val !== undefined && val > 0 && val < 100000000) {
+                if (val !== undefined && val > 0 && val < 10000000000) {
                 result[mapping[label]] = val;
                 console.log(`[Scraper Debug] 从上一个兄弟获取 ${mapping[label]}: ${val}`);
                 break;
@@ -415,7 +793,7 @@ class DouyinScraper {
                   const adjText = adj.textContent?.trim();
                   const val = parseCount(adjText);
                   console.log(`[Scraper Debug] 相邻元素 [${idx + offset}]: "${adjText}" -> ${val}`);
-                  if (val !== undefined && val > 0 && val < 100000000) {
+                  if (val !== undefined && val > 0 && val < 10000000000) {
                     result[mapping[label]] = val;
                     console.log(`[Scraper Debug] 从相邻元素获取 ${mapping[label]}: ${val}`);
                     break;

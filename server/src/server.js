@@ -3,6 +3,7 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const { initDatabase, isConnected } = require('./mysql-db');
+const videohaoLocalProxy = require('./videohao-local-proxy');
 
 // Playwright 在 Windows 上会先向系统临时目录写 artifacts。
 // 固定到项目目录，避免系统 Temp 权限或安全软件拦截导致 mkdtemp EPERM。
@@ -78,6 +79,29 @@ async function startServer() {
       process.exit(1);
     }
     throw error;
+  });
+
+  let shuttingDown = false;
+  const shutdown = async (reason, exitCode = 0) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[Shutdown] cleaning videohao local proxy: ${reason}`);
+    await videohaoLocalProxy.stop().catch(error => {
+      console.error('[Shutdown] videohao proxy cleanup failed:', error.message);
+    });
+    server.close(() => process.exit(exitCode));
+    setTimeout(() => process.exit(exitCode), 3000).unref();
+  };
+
+  process.once('SIGINT', () => shutdown('SIGINT', 0));
+  process.once('SIGTERM', () => shutdown('SIGTERM', 0));
+  process.once('uncaughtException', (error) => {
+    console.error(error);
+    shutdown('uncaughtException', 1);
+  });
+  process.once('unhandledRejection', (reason) => {
+    console.error(reason);
+    shutdown('unhandledRejection', 1);
   });
 }
 
