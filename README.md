@@ -1,5 +1,19 @@
 # 社交媒体监控系统
 
+## 界面预览
+
+### 监控节点管理
+
+![监控节点管理](docs/screenshots/01-account-management.png)
+
+### 账号数据实时监控
+
+![账号数据实时监控](docs/screenshots/02-content-monitoring.png)
+
+### 接入监控节点
+
+![接入监控节点](docs/screenshots/03-add-monitoring-node.png)
+
 项目名称：`social-media-monitor`
 
 中文名称：抖音、视频号、小红书监测
