@@ -50,7 +50,24 @@ try {
   Copy-Item (Join-Path $root 'start-production.bat') -Destination $bundleDir
   Copy-Item (Join-Path $root 'start-production.ps1') -Destination $bundleDir
   Copy-Item (Join-Path $root 'DEPLOYMENT.md') -Destination $bundleDir
-  Compress-Archive -Path (Join-Path $bundleDir '*') -DestinationPath $zipPath -Force
+  Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+  $temporaryZip = "$bundleDir.zip"
+  try {
+    $archive = [IO.Compression.ZipFile]::Open($temporaryZip, 'Create')
+    try {
+      foreach ($file in Get-ChildItem -LiteralPath $bundleDir -Recurse -File -Force) {
+        $entryName = $file.FullName.Substring($bundleDir.Length + 1).Replace('\', '/')
+        [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $entryName) | Out-Null
+      }
+    } finally {
+      $archive.Dispose()
+    }
+    Move-Item -LiteralPath $temporaryZip -Destination $zipPath -Force
+  } finally {
+    if (Test-Path -LiteralPath $temporaryZip) {
+      Remove-Item -LiteralPath $temporaryZip -Force
+    }
+  }
 } finally {
   if (Test-Path -LiteralPath $bundleDir) {
     $resolvedBundle = (Resolve-Path -LiteralPath $bundleDir).ProviderPath
