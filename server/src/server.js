@@ -1,8 +1,9 @@
+require('./load-env');
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
-const { initDatabase, isConnected } = require('./mysql-db');
+const { initDatabase, checkDatabase, closeDatabase } = require('./postgres-db');
 const videohaoLocalProxy = require('./videohao-local-proxy');
 
 // Playwright 在 Windows 上会先向系统临时目录写 artifacts。
@@ -15,6 +16,7 @@ process.env.TMPDIR = playwrightTmpDir;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '127.0.0.1';
 const clientDistDir = process.env.CLIENT_DIST_DIR || path.join(__dirname, '..', '..', 'client', 'dist');
 const hasClientDist = fs.existsSync(path.join(clientDistDir, 'index.html'));
 
@@ -37,12 +39,13 @@ app.use('/api/proxy', require('./routes/proxy'));
 app.use('/api/videohao-local-proxy', require('./routes/videohao-local-proxy'));
 
 // 健康检查
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    database: isConnected() ? 'mysql' : 'memory'
-  });
+app.get('/health', async (req, res) => {
+  try {
+    await checkDatabase();
+    res.json({ status: 'ok', timestamp: new Date().toISOString(), database: 'postgresql' });
+  } catch {
+    res.status(503).json({ status: 'unavailable', database: 'postgresql' });
+  }
 });
 
 if (hasClientDist) {
@@ -65,11 +68,11 @@ async function startServer() {
   // 初始化数据库
   await initDatabase();
 
-  const server = app.listen(PORT, () => {
+  const server = app.listen(Number(PORT), HOST, () => {
     console.log(`========================================`);
     console.log(`服务器运行在 http://localhost:${PORT}`);
     console.log(`API地址: http://localhost:${PORT}/api`);
-    console.log(`数据库: ${isConnected() ? 'MySQL (持久化)' : '内存 (测试模式)'}`);
+    console.log('数据库: PostgreSQL');
     console.log(`========================================`);
   });
 
@@ -89,7 +92,10 @@ async function startServer() {
     await videohaoLocalProxy.stop().catch(error => {
       console.error('[Shutdown] videohao proxy cleanup failed:', error.message);
     });
-    server.close(() => process.exit(exitCode));
+    server.close(async () => {
+      await closeDatabase().catch(error => console.error('[Shutdown] PostgreSQL:', error.message));
+      process.exit(exitCode);
+    });
     setTimeout(() => process.exit(exitCode), 3000).unref();
   };
 
@@ -105,6 +111,10 @@ async function startServer() {
   });
 }
 
-startServer();
+startServer().catch(async error => {
+  console.error('Startup failed:', error.message);
+  await closeDatabase();
+  process.exitCode = 1;
+});
 
 module.exports = app;

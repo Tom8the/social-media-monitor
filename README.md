@@ -18,7 +18,7 @@
 
 中文名称：抖音、视频号、小红书监测
 
-当前版本：`V1.2.0`
+当前版本：`V1.3.0`
 
 一个面向 Windows 的社交媒体账号与内容监控系统，支持接入抖音、小红书和视频号账号，采集账号资料及视频/笔记数据，并通过可视化后台统一查看、筛选和分析。
 
@@ -34,7 +34,7 @@
 - **内容检索**：按平台、账号、关键词、时间范围筛选和分页查看内容。
 - **告警管理**：展示 Cookie 失效、采集失败、限流等监控告警。
 - **视频号桌面采集**：可通过本地代理和桌面微信辅助采集视频号数据。
-- **生产部署**：后端可直接托管构建后的前端，适合部署到 Windows 服务器。
+- **生产部署**：后端可直接托管构建后的前端，支持使用 PostgreSQL 部署到 Ubuntu。
 
 ## 支持平台与采集方式
 
@@ -49,9 +49,9 @@
 ## 技术栈
 
 - 前端：Vue 3、Vite、Vue Router、Pinia、Element Plus、ECharts、Axios
-- 后端：Node.js、Express、MySQL2
+- 后端：Node.js、Express、node-postgres
 - 浏览器自动化：Playwright、Puppeteer、puppeteer-extra、Stealth Plugin
-- 数据库：MySQL 8.x
+- 数据库：PostgreSQL 17
 - 辅助脚本：PowerShell、Python（视频号桌面微信自动化）
 
 ## 运行环境
@@ -59,9 +59,9 @@
 ### 必需环境
 
 - Windows 10/11 或 Windows Server 2019+
-- Node.js 18 或更高版本
+- Node.js 22.21 或更新的受支持 LTS 版本
 - npm
-- MySQL 8.x
+- PostgreSQL 17，或用 Docker Desktop 启动项目自带的 PostgreSQL 17.10
 - Chrome/Chromium 浏览器
 
 ### 视频号功能额外环境
@@ -81,7 +81,7 @@ social-media-monitor/
 │  ├─ src/routes/           # 账号、视频、统计、代理接口
 │  ├─ src/*-scraper.js      # 各平台采集器
 │  └─ package.json
-├─ database/                # MySQL 建表脚本和初始化脚本
+├─ database/                # PostgreSQL 表结构和历史 MySQL 脚本
 ├─ scripts/                 # 数据导出等辅助脚本
 ├─ start-local.bat          # 本地开发启动入口
 ├─ start-production.bat     # 生产模式启动入口
@@ -115,48 +115,19 @@ cd ..\server
 npx playwright install chromium
 ```
 
-### 3. 创建并初始化 MySQL 数据库
+### 3. 启动本地 PostgreSQL
 
-先创建数据库：
-
-```sql
-CREATE DATABASE social_media_monitor
-  CHARACTER SET utf8mb4
-  COLLATE utf8mb4_unicode_ci;
-```
-
-然后导入表结构：
+将项目根目录的 `.env.example` 复制为 `.env`，设置 `DB_PASSWORD`。然后启动 Docker Desktop，并执行：
 
 ```powershell
-mysql -u root -p social_media_monitor < ..\database\schema.sql
+docker compose up -d --wait
 ```
 
-也可以根据本机 MySQL 配置使用 `database/setup.ps1` 或 `database/setup_simple.ps1` 初始化。
+本机数据库使用 PostgreSQL 17.10，默认监听 `127.0.0.1:55432`。数据库文件保存在 Compose 管理的数据卷。首次启动时自动创建应用表。
 
-### 4. 配置环境变量
+### 4. 配置应用
 
-复制 `.env.example` 作为配置参考，并设置以下变量：
-
-| 变量 | 默认值 | 说明 |
-| --- | --- | --- |
-| `PORT` | `3000` | 后端端口 |
-| `DB_HOST` | `127.0.0.1` | MySQL 主机 |
-| `DB_PORT` | `3306` | MySQL 端口 |
-| `DB_USER` | `root` | MySQL 用户名 |
-| `DB_PASSWORD` | 空 | MySQL 密码 |
-| `DB_NAME` | `social_media_monitor` | 数据库名称 |
-| `DB_POOL_LIMIT` | `10` | 数据库连接池上限 |
-| `CLIENT_DIST_DIR` | `../client/dist` | 生产环境前端构建目录 |
-
-当前后端直接读取系统环境变量。使用 PowerShell 启动时，可以先在当前终端设置：
-
-```powershell
-$env:DB_HOST = "127.0.0.1"
-$env:DB_PORT = "3306"
-$env:DB_USER = "root"
-$env:DB_PASSWORD = "你的MySQL密码"
-$env:DB_NAME = "social_media_monitor"
-```
+后端读取项目根目录的 `.env`，同名进程环境变量优先。常用配置包括 `DB_HOST`、`DB_PORT`、`DB_USER`、`DB_PASSWORD`、`DB_NAME` 和 `DB_TIMEZONE`。服务器部署见 [DEPLOYMENT.md](DEPLOYMENT.md)。
 
 ### 5. 启动本地开发环境
 
@@ -166,13 +137,13 @@ $env:DB_NAME = "social_media_monitor"
 start-local.bat
 ```
 
-启动后访问：
+启动后按终端打印的地址访问。默认地址如下：
 
 - 前端：<http://127.0.0.1:5173>
 - 后端：<http://127.0.0.1:3000>
 - 健康检查：<http://127.0.0.1:3000/health>
 
-本地启动脚本会自动清理本项目占用的 3000、5173 端口，并将运行日志写入 `server/logs/`。
+默认端口被占用时，脚本会选用后续的空闲端口，并让前端代理连接实际启动的后端。运行日志写入 `server/logs/`。
 
 ## 生产部署
 
@@ -210,10 +181,10 @@ powershell -ExecutionPolicy Bypass -File .\package-release.ps1
 输出文件：
 
 ```text
-release/social-media-monitor.zip
+release/social-media-monitor-postgresql.zip
 ```
 
-解压后，按照 `DEPLOYMENT.md` 配置 MySQL、环境变量和 Node.js 依赖即可启动。
+解压后，按照 `DEPLOYMENT.md` 配置 PostgreSQL、环境变量和 Node.js 依赖即可启动。
 
 ## 常用后端接口
 
@@ -239,12 +210,12 @@ release/social-media-monitor.zip
 - `alerts`：系统告警
 - `daily_stats`：每日统计数据
 
-默认情况下，MySQL 连接失败时后端会回退到内存数据模式，适合临时开发测试；内存模式不会持久化数据，正式使用请确保 MySQL 连接正常。
+后端启动时检查 PostgreSQL 连接和应用表。运行中连接中断时，健康检查返回 HTTP 503。
 
 ## 安全与合规说明
 
 - Cookie、登录状态和代理证书属于敏感信息，请勿提交到 GitHub。
-- 不要把真实的 `.env`、账号 Cookie、二维码、运行日志或 `mysql_data/` 提交到公开仓库。
+- 不要把真实的 `.env`、账号 Cookie、二维码、运行日志或数据库备份 提交到公开仓库。
 - 请遵守抖音、小红书、微信视频号的服务条款、robots 规则和当地法律法规，仅采集你有权访问和使用的数据。
 - 采集频率应保持合理，避免对平台服务造成不必要压力。
 
@@ -252,11 +223,11 @@ release/social-media-monitor.zip
 
 ### 页面无法打开
 
-确认前端依赖已安装，并检查 5173 端口是否被其他程序占用。开发环境可重新执行 `start-local.bat`。
+确认前端依赖已安装，重新执行 `start-local.bat`，并使用终端打印的前端地址。
 
 ### 后端提示数据库连接失败
 
-检查 MySQL 服务是否启动、数据库是否创建，以及 `DB_HOST`、`DB_PORT`、`DB_USER`、`DB_PASSWORD` 和 `DB_NAME` 是否正确。可访问 `/health` 查看当前使用的是 `mysql` 还是 `memory` 模式。
+检查 PostgreSQL 是否启动，确认 `DB_HOST`、`DB_PORT`、`DB_USER`、`DB_PASSWORD` 和 `DB_NAME`。访问终端打印的后端地址下的 `/health` 检查连接状态。
 
 ### 采集失败或 Cookie 失效
 

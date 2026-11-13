@@ -19,11 +19,12 @@ function getArg(name, fallback = null) {
 
 async function main() {
   const outputPath = getArg('--output', path.join(process.cwd(), 'database-export.sql'));
+  if (!process.env.DB_PASSWORD) throw new Error('Set DB_PASSWORD for the legacy MySQL database.');
   const dbConfig = {
     host: process.env.DB_HOST || '127.0.0.1',
     port: getEnvInt('DB_PORT', 3306),
     user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || 'root123456',
+    password: process.env.DB_PASSWORD,
     database: process.env.DB_NAME || 'social_media_monitor'
   };
 

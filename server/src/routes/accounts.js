@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
-const { database, getPool } = require('../mysql-db');
+const { database } = require('../postgres-db');
 const DouyinScraper = require('../scraper');
 const XiaohongshuScraper = require('../xhs-scraper');
 const VideohaoScraper = require('../videohao-scraper');
@@ -1667,7 +1667,6 @@ async function fetchAccountProfileOnly(account) {
 router.get('/global-cookie/status', async (req, res) => {
   try {
     const platform = req.query.platform;
-    const pool = getPool();
 
     if (platform) {
       const normalizedPlatform = normalizeGlobalCookiePlatform(platform);
@@ -1683,7 +1682,7 @@ router.get('/global-cookie/status', async (req, res) => {
           }
         });
       }
-      const [rows] = await pool.query('SELECT * FROM global_cookies WHERE id = ?', [getGlobalCookieId(normalizedPlatform)]);
+      const rows = await database.getGlobalCookies([getGlobalCookieId(normalizedPlatform)]);
       const cookie = rows[0];
       return res.json({
         code: 0,
@@ -1697,10 +1696,7 @@ router.get('/global-cookie/status', async (req, res) => {
     }
 
     const ids = Object.values(GLOBAL_COOKIE_PLATFORM_IDS);
-    const [rows] = await pool.query(
-      `SELECT * FROM global_cookies WHERE id IN (${ids.map(() => '?').join(', ')})`,
-      ids
-    );
+    const rows = await database.getGlobalCookies(ids);
     const byPlatform = {};
     rows.forEach(cookie => {
       byPlatform[cookie.platform] = {
@@ -1741,13 +1737,7 @@ router.post('/global-cookie/save', async (req, res) => {
     const cookieStr = typeof cookieData === 'string' ? cookieData : JSON.stringify(cookieData);
     const cookieId = getGlobalCookieId(platform);
     
-    const pool = getPool();
-    // 使用 UPSERT
-    await pool.query(`
-      INSERT INTO global_cookies (id, platform, cookie_data, is_valid)
-      VALUES (?, ?, ?, TRUE)
-      ON DUPLICATE KEY UPDATE platform = ?, cookie_data = ?, is_valid = TRUE, updated_at = NOW()
-    `, [cookieId, platform, cookieStr, platform, cookieStr]);
+    await database.saveGlobalCookie(cookieId, platform, cookieStr);
     
     console.log(`[GlobalCookie] 已保存全局Cookie到数据库 (平台: ${platform})`);
     res.json({ code: 0, message: 'Cookie保存成功' });
@@ -1760,8 +1750,7 @@ router.post('/global-cookie/save', async (req, res) => {
 router.post('/global-cookie/invalidate', async (req, res) => {
   try {
     const platform = normalizeGlobalCookiePlatform(req.body?.platform || req.query.platform);
-    const pool = getPool();
-    await pool.query('UPDATE global_cookies SET is_valid = FALSE WHERE id = ?', [getGlobalCookieId(platform)]);
+    await database.invalidateGlobalCookie(getGlobalCookieId(platform));
     console.log(`[GlobalCookie] 已标记全局Cookie失效 (平台: ${platform})`);
     res.json({ code: 0, message: 'Cookie已标记失效' });
   } catch (error) {
@@ -1773,8 +1762,7 @@ router.post('/global-cookie/invalidate', async (req, res) => {
 router.delete('/global-cookie', async (req, res) => {
   try {
     const platform = normalizeGlobalCookiePlatform(req.body?.platform || req.query.platform);
-    const pool = getPool();
-    await pool.query('DELETE FROM global_cookies WHERE id = ?', [getGlobalCookieId(platform)]);
+    await database.deleteGlobalCookie(getGlobalCookieId(platform));
     console.log(`[GlobalCookie] 已清除全局Cookie (平台: ${platform})`);
     res.json({ code: 0, message: 'Cookie已清除' });
   } catch (error) {
@@ -1786,13 +1774,12 @@ router.delete('/global-cookie', async (req, res) => {
 async function getGlobalCookie(platform = 'douyin') {
   try {
     const normalizedPlatform = normalizeGlobalCookiePlatform(platform);
-    const pool = getPool();
-    const [rows] = await pool.query('SELECT * FROM global_cookies WHERE id = ? AND is_valid = TRUE', [getGlobalCookieId(normalizedPlatform)]);
-    if (rows[0]) {
+    const [cookie] = await database.getGlobalCookies([getGlobalCookieId(normalizedPlatform)]);
+    if (cookie?.is_valid) {
       return {
-        cookieData: rows[0].cookie_data,
-        platform: rows[0].platform,
-        updatedAt: rows[0].updated_at
+        cookieData: cookie.cookie_data,
+        platform: cookie.platform,
+        updatedAt: cookie.updated_at
       };
     }
     return null;
@@ -1806,8 +1793,7 @@ async function getGlobalCookie(platform = 'douyin') {
 async function invalidateGlobalCookie(platform = 'douyin') {
   try {
     const normalizedPlatform = normalizeGlobalCookiePlatform(platform);
-    const pool = getPool();
-    await pool.query('UPDATE global_cookies SET is_valid = FALSE WHERE id = ?', [getGlobalCookieId(normalizedPlatform)]);
+    await database.invalidateGlobalCookie(getGlobalCookieId(normalizedPlatform));
     console.log(`[GlobalCookie] 已标记全局Cookie失效 (平台: ${normalizedPlatform})`);
     return true;
   } catch (error) {
@@ -1819,9 +1805,8 @@ async function invalidateGlobalCookie(platform = 'douyin') {
 // 临时删除视频接口
 router.delete('/videos/:videoId', async (req, res) => {
   try {
-    const pool = getPool();
-    const [result] = await pool.query('DELETE FROM videos WHERE video_id = ?', [req.params.videoId]);
-    res.json({ code: 0, message: '删除成功', deleted: result.affectedRows });
+    const deleted = await database.deleteVideosByExternalId(req.params.videoId);
+    res.json({ code: 0, message: '删除成功', deleted });
   } catch (error) {
     res.status(500).json({ code: 500, message: error.message });
   }

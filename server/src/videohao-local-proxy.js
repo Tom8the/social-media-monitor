@@ -4,7 +4,7 @@ const crypto = require('crypto');
 const { execFile } = require('child_process');
 const net = require('net');
 const { Proxy } = require('http-mitm-proxy');
-const { database } = require('./mysql-db');
+const { database } = require('./postgres-db');
 const VideohaoScraper = require('./videohao-scraper');
 
 const PLACEHOLDER_TITLE = '\u89c6\u9891\u53f7\u4f5c\u54c1\uff08\u5f85\u8865\u5168\uff09';

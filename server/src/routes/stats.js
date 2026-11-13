@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { database } = require('../mysql-db');
+const { database } = require('../postgres-db');
 
 // 获取概览统计
 router.get('/overview', async (req, res) => {

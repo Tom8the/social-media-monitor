@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { v4: uuidv4 } = require('uuid');
-const { database } = require('../mysql-db');
+const { database } = require('../postgres-db');
 
 // 获取视频列表
 router.get('/', async (req, res) => {
@@ -75,7 +75,7 @@ router.post('/', async (req, res) => {
       published_at: req.body.publishedAt || new Date().toISOString()
     };
 
-    const result = await database.createVideo(video);
+    const result = await database.upsertVideo(video);
     res.json({
       code: 0,
       message: '创建成功',

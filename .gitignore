@@ -13,6 +13,8 @@ server/logs/
 server/tmp/
 client/tmp/
 mysql_data/
+.env
+*.dump
 server/qrcodes/
 tmp_wechat_windows/
 
@@ -58,6 +60,7 @@ chat_history_export.md
 douyin_api_analysis_report.md
 ui_light_cyberpunk.html
 videohao-scraper.js
+!server/src/videohao-scraper.js
 
 # OS cruft
 .DS_Store

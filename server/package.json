@@ -1,6 +1,6 @@
 {
   "name": "social-media-monitor-server",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "description": "社交媒体数据监控系统后端服务",
   "main": "src/server.js",
   "scripts": {
@@ -11,11 +11,14 @@
     "cors": "^2.8.5",
     "express": "^4.18.2",
     "http-mitm-proxy": "^1.1.0",
-    "mysql2": "^3.22.3",
+    "pg": "^8.23.1",
     "playwright": "^1.60.0",
     "puppeteer": "^25.0.4",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
     "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "mysql2": "^3.24.6"
   }
 }
