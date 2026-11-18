@@ -44,4 +44,26 @@ pg_restore -h 127.0.0.1 -p 5432 -U social_media_monitor -d social_media_monitor 
 
 ## Ubuntu 上的采集功能
 
-抖音和小红书的采集需要对应的 Chromium 浏览器及其 Linux 依赖。现有扫码流程会启动有界面的浏览器，部署时需要可用的图形会话并测试实际登录。视频号桌面微信、系统代理和 CA 安装调用 Windows 工具，Ubuntu 上需要独立适配。
+抖音和小红书的采集需要 Chrome 或 Chromium 及其 Linux 依赖。网页中的全局 Cookie 授权使用每次会话独立的 Xvfb 桌面，通过 FFmpeg 显示画面，通过 xdotool 转发用户输入。Ubuntu 上可用 `sudo apt-get install xvfb ffmpeg xdotool` 安装这些依赖。原有桌面扫码入口需要可用的图形会话。
+
+### 微信视频号
+
+Ubuntu 使用已登录的 Linux 微信和 [wx_channels_download v261106](https://github.com/ltaoo/wx_channels_download/releases/tag/v261106)。在 x86_64 上可运行 [linuxserver/weixin](https://github.com/linuxserver/docker-weixin) 的 amd64 镜像，配合下载器的 `linux_x86_64` 发行包。保留已验证的微信数据卷、证书和 TUN 配置，并在微信中打开视频号页面。
+
+后端默认访问 `http://127.0.0.1:2022`。如果下载器在独立容器内、后端在 VPS 宿主机运行，请让下载器在容器内监听 `0.0.0.0:2022`，并将端口映射到宿主机回环地址（例如 `127.0.0.1:2022:2022`）。如果两个服务都在 Docker 中，可以使用私有 Docker 网络和下载器服务名作为地址。
+
+```dotenv
+VIDEOHAO_BRIDGE_URL=http://127.0.0.1:2022
+VIDEOHAO_BRIDGE_MAX_PAGES=5
+```
+
+环境变量保存到项目根目录的 `.env` 后，重启后端。分页上限为每个账号每次 5 页，可设为 1–50 页。到达上限时，界面会提示仍有作品未采集。
+
+```bash
+curl -fsS http://127.0.0.1:2022/api/channels/status
+curl -fsS http://127.0.0.1:3000/api/accounts/videohao/status
+```
+
+确认两个状态接口都返回 `data.available: true` 后，在账号管理中按名称搜索或输入 Finder ID，在账号卡片运行「数据同步」，或在视频列表按账号、按平台发起采集。已保存的 Finder ID 可以直接使用。客户端下载器断开时，重新打开微信里的视频号页面后再检测。
+
+Windows 默认使用原有桌面微信和代理，也可以通过设置 `VIDEOHAO_BRIDGE_URL` 选择下载器。桌面微信采集读取当前加载的作品，下载器模式支持分页和日期筛选。

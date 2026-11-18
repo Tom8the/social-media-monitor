@@ -45,7 +45,7 @@
           正在采集数据...
         </div>
         <div class="sync-progress-stats">
-          <span>{{ syncStatus.completed }}/{{ syncStatus.total }} 完成</span>
+          <span>{{ syncStatus.completed + syncStatus.failed }}/{{ syncStatus.total }} 完成</span>
           <span v-if="syncStatus.failed > 0" class="sync-failed">{{ syncStatus.failed }} 失败</span>
         </div>
       </div>
@@ -481,8 +481,6 @@ const syncStatus = ref({
   status: 'idle'
 })
 let syncPollingTimer = null
-let videohaoLocalCapturePollingTimer = null
-let videohaoLocalCapturedCount = 0
 
 const clearVideoSelectionState = () => {
   selectedAccount.value = ''
@@ -511,7 +509,7 @@ const syncAccountSelectionState = () => {
 
 const syncPercentage = computed(() => {
   if (syncStatus.value.total === 0) return 0
-  return Math.round((syncStatus.value.completed / syncStatus.value.total) * 100)
+  return Math.round(((syncStatus.value.completed + syncStatus.value.failed) / syncStatus.value.total) * 100)
 })
 
 // ========== 格式化方法 ==========
@@ -556,7 +554,7 @@ const getPlatColor = (p) => {
 const getGlobalCookieTitle = (platform) => {
   if (platform === 'videohao') {
     const state = globalCookieStates.value.videohao
-    return `视频号桌面微信：${state?.hasCookie ? '已开启' : '未检测到或未登录'}。点击重新检测`
+    return `视频号采集：${state?.message || '等待检测'}。点击重新检测`
   }
   const state = globalCookieStates.value[platform]
   const status = state?.hasCookie ? '已获取' : '未授权或已失效'
@@ -573,7 +571,7 @@ const loadGlobalCookieStatus = async () => {
         ...(res.data.platforms || {})
       }
     }
-    await loadVideohaoDesktopStatus(false)
+    await loadVideohaoCaptureStatus(false)
   } catch (e) {
     console.error('加载全局Cookie状态失败', e)
   }
@@ -581,7 +579,7 @@ const loadGlobalCookieStatus = async () => {
 
 const openGlobalCookieLogin = async (platform) => {
   if (platform === 'videohao') {
-    await loadVideohaoDesktopStatus(true)
+    await loadVideohaoCaptureStatus(true)
     return
   }
   const state = globalCookieStates.value[platform]
@@ -599,22 +597,22 @@ const openGlobalCookieLogin = async (platform) => {
   startGlobalCookieLogin(platform)
 }
 
-const loadVideohaoDesktopStatus = async (showMessage = true) => {
+const loadVideohaoCaptureStatus = async (showMessage = true) => {
   try {
-    const res = await accountApi.getVideohaoDesktopStatus()
+    const res = await accountApi.getVideohaoCaptureStatus()
     if (res.code === 0) {
       globalCookieStates.value = {
         ...globalCookieStates.value,
         videohao: res.data
       }
       if (showMessage) {
-        if (res.data.available) ElMessage.success('桌面微信已开启，可用于视频号公开监控')
-        else ElMessage.warning(res.data.message || '未检测到可用的桌面微信')
+        if (res.data.available) ElMessage.success(res.data.message || '视频号采集已连接')
+        else ElMessage.warning(res.data.message || '视频号采集尚未连接')
       }
       return res.data.available
     }
   } catch (e) {
-    if (showMessage) ElMessage.error('检测桌面微信失败：' + (e.response?.data?.message || e.message))
+    if (showMessage) ElMessage.error('检测视频号采集失败：' + (e.response?.data?.message || e.message))
   }
   return false
 }
@@ -707,72 +705,6 @@ const selectionNeedsGlobalCookie = () => {
     return allAccounts.value.some(acc => acc.platform_code === selectedPlatform.value && acc.status === 'public')
   }
   return false
-}
-
-const getSelectedAccount = () => {
-  if (!selectedAccount.value) return null
-  return allAccounts.value.find(acc => acc.id === selectedAccount.value) || null
-}
-
-const isSelectedPublicVideohao = () => {
-  const account = getSelectedAccount()
-  return account && (account.platform_code || account.platform) === 'videohao' && account.status === 'public'
-}
-
-const startSelectedVideohaoLocalCapture = async () => {
-  const account = getSelectedAccount()
-  if (!account) return false
-  const finderUsername = String(account.sec_uid || account.unique_id || '')
-  if (!finderUsername.includes('@finder')) {
-    ElMessage.warning('该公开视频号还没有 finder_username，请在账号监控管理页重新添加一次该账号')
-    return true
-  }
-  try {
-    syncing.value = true
-    const res = await accountApi.desktopVideohaoSync({ accountId: account.id, timeout: 30000 })
-    if (res.code !== 0) {
-      ElMessage.error(res.message || '视频号桌面微信采集失败')
-      return true
-    }
-    const saved = Number(res.data?.saved) || 0
-    await loadVideos()
-    ElMessage.success(saved > 0 ? `视频号桌面微信采集完成，新增/更新 ${saved} 条数据` : '视频号桌面微信采集完成，暂无新增数据')
-    return true
-  } catch (e) {
-    ElMessage.error('视频号桌面微信采集失败：' + (e.response?.data?.message || e.message))
-    return true
-  } finally {
-    syncing.value = false
-  }
-}
-
-const startVideohaoLocalCapturePolling = (initialCapturedCount = 0) => {
-  stopVideohaoLocalCapturePolling()
-  videohaoLocalCapturedCount = Number(initialCapturedCount) || 0
-  videohaoLocalCapturePollingTimer = setInterval(async () => {
-    try {
-      const res = await accountApi.getVideohaoLocalProxyStatus()
-      if (res.code !== 0 || !res.data?.running) {
-        stopVideohaoLocalCapturePolling()
-        return
-      }
-      const nextCapturedCount = Number(res.data.capturedCount) || 0
-      if (nextCapturedCount <= videohaoLocalCapturedCount) return
-      const addedCount = nextCapturedCount - videohaoLocalCapturedCount
-      videohaoLocalCapturedCount = nextCapturedCount
-      await loadVideos()
-      ElMessage.success(`视频号已捕获 ${addedCount} 条数据，列表已刷新`)
-    } catch (e) {
-      console.error('轮询视频号本地采集状态失败', e)
-    }
-  }, 2000)
-}
-
-const stopVideohaoLocalCapturePolling = () => {
-  if (videohaoLocalCapturePollingTimer) {
-    clearInterval(videohaoLocalCapturePollingTimer)
-    videohaoLocalCapturePollingTimer = null
-  }
 }
 
 const getTimeRangeText = () => {
@@ -871,11 +803,6 @@ const refreshData = async () => {
   }
   if (syncing.value) return
 
-  if (isSelectedPublicVideohao()) {
-    await startSelectedVideohaoLocalCapture()
-    return
-  }
-
   // 检查全局Cookie状态
   try {
     const cookiePlatform = getSelectedCookiePlatform()
@@ -904,22 +831,13 @@ const refreshData = async () => {
 
 const doRefreshData = async () => {
   syncing.value = true
+  syncStatus.value = {
+    jobId: null, total: 1, completed: 0, failed: 0, status: 'running',
+    currentAccount: selectedAccount.value ? getAccountName(selectedAccount.value) : ''
+  }
 
   try {
-    // 计算时间范围
-    let startDate = null
-    let endDate = null
-    if (timeRangeType.value === 'custom' && customDateRange.value && customDateRange.value.length === 2) {
-      startDate = customDateRange.value[0]
-      endDate = customDateRange.value[1]
-    } else if (timeRangeType.value && timeRangeType.value !== 'all') {
-      const now = new Date()
-      endDate = now.toISOString().split('T')[0]
-      const daysMap = { '7': 7, '14': 14, '30': 30, '90': 90, '180': 180, '365': 365 }
-      const days = daysMap[timeRangeType.value] || 30
-      const start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000)
-      startDate = start.toISOString().split('T')[0]
-    }
+    const { startDate, endDate } = getTimeRangeDates()
 
     if (selectedAccount.value) {
       // 单个账号同步
@@ -931,7 +849,10 @@ const doRefreshData = async () => {
         if (d.addedCount) parts.push(`新增 ${d.addedCount}`)
         if (d.updatedCount) parts.push(`更新 ${d.updatedCount}`)
         if (d.deletedCount) parts.push(`删除 ${d.deletedCount}`)
-        ElMessage.success(`采集完成：${parts.length ? parts.join('，') : '无变化'}`)
+        if (!parts.length && d.saved) parts.push(`保存 ${d.saved}`)
+        const message = `采集完成：${parts.length ? parts.join('，') : '无变化'}`
+        if (d.coverage?.hasMore || d.coverage?.ignored) ElMessage.warning(message + '，部分作品未采集')
+        else ElMessage.success(message)
         await loadVideos()
       } else if (res.code === 401 && res.data?.needRelogin) {
         // Cookie失效，重新授权
@@ -954,8 +875,12 @@ const doRefreshData = async () => {
       ElMessage.info(`正在采集 ${getPlatformName(selectedPlatform.value)} 的数据...`)
       const res = await accountApi.batchSync({ platform: selectedPlatform.value, startDate, endDate })
       if (res.code === 0) {
-        ElMessage.success('采集完成')
-        await loadVideos()
+        if (!res.data?.total) {
+          ElMessage.info('没有待采集的账号')
+          return
+        }
+        syncStatus.value = { jobId: res.data.jobId, total: res.data.total, completed: 0, failed: 0, status: 'running' }
+        startSyncPolling(res.data.jobId)
       } else if (res.code === 401 && res.data?.needRelogin) {
         // Cookie失效
         ElMessageBox.alert(
@@ -975,7 +900,7 @@ const doRefreshData = async () => {
     }
   } catch (e) {
     // 检查是否是 Cookie 失效
-    if (e.response?.status === 401 || e.response?.data?.code === 401) {
+    if (getSelectedCookiePlatform() !== 'videohao' && (e.response?.status === 401 || e.response?.data?.code === 401)) {
       ElMessageBox.alert(
         '全局Cookie已过期，请重新扫码授权后再采集。',
         '登录过期',
@@ -991,7 +916,7 @@ const doRefreshData = async () => {
       ElMessage.error('采集失败：' + (e.response?.data?.message || e.message))
     }
   } finally {
-    syncing.value = false
+    if (!syncPollingTimer) syncing.value = false
   }
 }
 
@@ -1035,8 +960,10 @@ const startSyncPolling = (jobId) => {
           syncing.value = false
 
           const msg = `采集完成: ${res.data.completed} 成功${res.data.failed > 0 ? '，' + res.data.failed + ' 失败' : ''}`
-          if (res.data.failed > 0) {
-            ElMessage.warning(msg)
+          const failed = res.data.results?.find(result => !result.success)
+          const partial = res.data.results?.some(result => result.coverage?.hasMore || result.coverage?.ignored)
+          if (failed || partial) {
+            ElMessage.warning(failed ? `${msg}。${failed.nickname}：${failed.error}` : msg + '，部分账号仍有未采集作品')
           } else {
             ElMessage.success(msg)
           }
@@ -1046,7 +973,9 @@ const startSyncPolling = (jobId) => {
         }
       }
     } catch (e) {
-      console.error('轮询采集进度失败', e)
+      stopSyncPolling()
+      syncing.value = false
+      ElMessage.error(e.response?.status === 404 ? '采集任务已失效，请重新发起' : '暂时无法查询采集进度')
     }
   }, 3000) // 每 3 秒轮询一次
 }
@@ -1121,7 +1050,6 @@ onActivated(() => {
 
 onUnmounted(() => {
   stopSyncPolling()
-  stopVideohaoLocalCapturePolling()
   closeGlobalCookieDialog()
   window.removeEventListener('focus', refreshAccountsIfVisible)
   document.removeEventListener('visibilitychange', refreshAccountsIfVisible)

@@ -4,6 +4,7 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { v4: uuidv4 } = require('uuid');
 const path = require('path');
 const fs = require('fs');
+const { createInteractivePage, openLoginPage } = require('./login-preview');
 
 // 启用 stealth 插件
 puppeteer.use(StealthPlugin());
@@ -15,11 +16,12 @@ class QRLoginService {
   }
 
   // 创建新的扫码会话
-  async createSession() {
+  async createSession({ globalCookie = false } = {}) {
     const sessionId = uuidv4();
     const session = {
       id: sessionId,
-      status: 'pending', // pending, scanned, confirmed, expired, error
+      globalCookie,
+      status: globalCookie ? 'opening' : 'pending',
       qrCodeUrl: null,   // 抖音返回的二维码页面URL
       qrToken: null,     // 用于轮询状态的token
       userData: null,
@@ -32,9 +34,21 @@ class QRLoginService {
 
     this.sessions.set(sessionId, session);
 
+    if (globalCookie) {
+      this._startExpiryCheck(sessionId);
+      void this._startInteractiveLogin(session).catch(async error => {
+        if (!['opening', 'pending', 'scanned'].includes(session.status)) return;
+        console.error('[QRLogin] 无法打开授权页:', error.name);
+        session.status = 'error';
+        session.error = '无法打开抖音登录页，请重试';
+        await this._closeSession(session);
+      });
+      return { sessionId, status: session.status, expiresAt: session.expiresAt };
+    }
+
     // 创建新会话前，先关闭所有旧会话的浏览器，避免残留进程冲突
     for (const [oldId, oldSession] of this.sessions) {
-      if (oldId !== sessionId && oldSession.browser) {
+      if (!globalCookie && !oldSession.globalCookie && oldId !== sessionId && oldSession.browser) {
         console.log(`[QRLogin] 清理旧会话浏览器: ${oldId}`);
         try {
           await oldSession.browser.close();
@@ -50,6 +64,7 @@ class QRLoginService {
       console.error('[QRLogin] 启动扫码登录失败:', error.message);
       session.status = 'error';
       session.error = error.message;
+      await this._closeSession(session);
     }
 
     // 启动过期检查
@@ -57,8 +72,9 @@ class QRLoginService {
 
     return {
       sessionId,
-      qrCode: null, // 不再需要二维码图片，用户在弹出的浏览器中扫码
+      qrCode: null,
       status: session.status,
+      error: session.error,
       expiresAt: session.expiresAt
     };
   }
@@ -88,11 +104,11 @@ class QRLoginService {
       ]
     });
 
-    // 每次创建新页面
+    if (session.status === 'expired') return browser.close();
+    session.browser = browser;
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 800 });
 
-    session.browser = browser;
     session.page = page;
 
     // 拦截二维码 API 响应
@@ -128,6 +144,7 @@ class QRLoginService {
         try {
           const data = await response.json();
           const checkData = data.data || data;
+
           
           if (checkData.status) {
             console.log('[QRLogin] 扫码状态:', checkData.status);
@@ -228,7 +245,6 @@ class QRLoginService {
       await this._wait(2000);
       if (session.qrCodeUrl) {
         console.log('[QRLogin] ✅ 二维码已生成');
-        session.status = 'pending';
         break;
       }
     }
@@ -241,6 +257,60 @@ class QRLoginService {
     this._monitorLoginStatus(session);
 
     return session;
+  }
+
+  async _startInteractiveLogin(session) {
+    const page = await createInteractivePage(session);
+    if (!page) return;
+    let loginPanelOpened = false;
+    page.on('response', async response => {
+      const url = new URL(response.url());
+      if (url.hostname !== 'www.douyin.com') return;
+      if (url.pathname === '/passport/web/get_qrcode/' && response.ok() && !loginPanelOpened) {
+        loginPanelOpened = true;
+        console.log('[QRLogin] 抖音登录页已提供扫码入口');
+      }
+      if (url.pathname !== '/passport/web/check_qrconnect/') return;
+      try {
+        const data = await response.json();
+        if (session.status === 'pending' && ['scanned', 'confirmed', 'success'].includes((data.data || data).status)) {
+          session.status = 'scanned';
+        }
+      } catch {}
+    });
+    if (!await openLoginPage(session, page, 'https://www.douyin.com/user/self')) return;
+    void (async () => {
+      for (let attempt = 0; attempt < 12 && session.status === 'pending' && !loginPanelOpened; attempt++) {
+        const clicked = await page.evaluate(() => {
+          const button = Array.from(document.querySelectorAll('button, a'))
+            .find(element => element.textContent.trim() === '登录' && element.checkVisibility());
+          button?.click();
+          return !!button;
+        }).catch(() => false);
+        if (clicked) return;
+        await this._wait(1000);
+      }
+    })();
+    await this._monitorGlobalCookie(session);
+  }
+
+  async _monitorGlobalCookie(session) {
+    while (session.page && ['pending', 'scanned'].includes(session.status) && Date.now() < session.expiresAt) {
+      try {
+        const cookies = await session.page.context().cookies('https://www.douyin.com');
+        if (Date.now() < session.expiresAt && ['pending', 'scanned'].includes(session.status) &&
+          cookies.some(cookie => ['sessionid', 'sessionid_ss', 'sid_tt', 'sid_guard'].includes(cookie.name) && cookie.value)) {
+          session.cookieData = JSON.stringify(cookies);
+          session.status = 'confirmed';
+          await this._closeSession(session);
+          return;
+        }
+      } catch (error) {
+        console.error('[QRLogin] 检查授权状态失败:', error.message);
+      }
+      await this._wait(1000);
+    }
+    if (['pending', 'scanned'].includes(session.status)) session.status = 'expired';
   }
 
   // 生成二维码图片（截图二维码区域）
@@ -994,7 +1064,7 @@ class QRLoginService {
   // 获取二维码图片路径
   getQRImagePath(sessionId) {
     const session = this.sessions.get(sessionId);
-    if (!session || !session.qrImagePath) {
+    if (session?.status !== 'pending' || Date.now() >= session.expiresAt || !session.qrImagePath) {
       return null;
     }
     return session.qrImagePath;
@@ -1009,8 +1079,9 @@ class QRLoginService {
 
     return {
       sessionId: session.id,
+      globalCookie: session.globalCookie,
       status: session.status,
-      qrCode: session.status === 'pending' ? `/api/accounts/qr-code/image/${sessionId}` : null,
+      qrCode: this.getQRImagePath(sessionId) ? `/api/accounts/qr-code/image/${sessionId}` : null,
       userData: session.status === 'confirmed' ? session.userData : null,
       cookieData: session.status === 'confirmed' ? session.cookieData : null,
       error: session.error,
@@ -1051,6 +1122,7 @@ class QRLoginService {
       if (Date.now() > session.expiresAt ||
           session.status === 'error') {
         clearInterval(checkInterval);
+        if (['opening', 'pending', 'scanned'].includes(session.status)) session.status = 'expired';
 
         // 失败/过期后5秒关闭
         setTimeout(() => {

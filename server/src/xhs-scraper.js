@@ -1,12 +1,6 @@
+require('./browser-temp');
 const fs = require('fs');
 const path = require('path');
-
-const playwrightTmpDir = path.join(__dirname, '..', 'tmp', 'playwright');
-fs.mkdirSync(playwrightTmpDir, { recursive: true });
-process.env.TEMP = playwrightTmpDir;
-process.env.TMP = playwrightTmpDir;
-process.env.TMPDIR = playwrightTmpDir;
-
 const { chromium } = require('playwright');
 
 function parseCountValue(value) {
@@ -24,6 +18,27 @@ function parseCountValue(value) {
 
 function firstPresent(...values) {
   return values.find((value) => value !== undefined && value !== null && value !== '');
+}
+
+function parseProfileCounts(interactions = [], stats = {}) {
+  const read = (labels, fields) => {
+    const interaction = interactions.find((entry) =>
+      [entry?.type, entry?.name, entry?.title, entry?.label].some((label) =>
+        labels.includes(String(label || '').trim().toLowerCase())
+      )
+    );
+    const values = [interaction?.count, interaction?.value, interaction?.num, ...fields.map((field) => stats[field])];
+    const value = values.find((candidate) =>
+      /^\d[\d,]*(?:\.\d+)?\s*[亿万千wk]?\s*[+＋]?$/i.test(String(candidate ?? '').trim())
+    );
+    if (value === undefined) return undefined;
+    return parseCountValue(String(value).trim().replace(/[+＋]/g, ''));
+  };
+  return {
+    follower_count: read(['粉丝', 'fans', 'follower', 'followers'], ['fans', 'fansCount', 'fanCount', 'followerCount', 'followers', 'follower_count']),
+    following_count: read(['关注', 'follow', 'follows', 'following'], ['follows', 'followCount', 'followingCount', 'following_count']),
+    like_count: read(['获赞', '赞与收藏', '获赞与收藏', 'interaction', 'liked', 'like', 'likes'], ['likedCount', 'likeCount', 'likes', 'liked_count'])
+  };
 }
 
 function extractAvatarCandidate(...sources) {
@@ -185,69 +200,58 @@ class XiaohongshuScraper {
 
       const state = await this._getPageState(page);
       if (state === 'login') {
-        await page.close().catch(() => {});
         return { success: false, error: '小红书Cookie需要重新扫码验证', cookieExpired: true };
       }
       if (state === 'blocked') {
-        await page.close().catch(() => {});
         return { success: false, error: '小红书触发安全验证，请稍后再试', rateLimited: true };
       }
 
-      const userIdFromUrl = this._extractUserId(page.url()) || this._extractUserId(url);
-      const profile = await this._extractProfileFromPage(page, userIdFromUrl);
+      const requestedUserId = this._extractUserId(url);
+      const pageUserId = this._extractUserId(page.url());
+      const profile = await this._extractProfileFromPage(page);
+      const userId = requestedUserId || pageUserId || profile.unique_id;
+      if ((pageUserId && pageUserId !== userId) || (profile.unique_id && profile.unique_id !== userId)) {
+        return { success: false, error: '小红书主页与目标账号不匹配' };
+      }
+      if (!pageUserId && !profile.unique_id) {
+        return { success: false, error: '无法提取小红书账号信息，请使用用户主页链接或登录后重试' };
+      }
       const useCreatorProfile = options.useCreatorProfile !== false;
       const creatorSnapshot = useCreatorProfile && Array.isArray(cookies) && cookies.length > 0
-        ? await this._fetchCreatorSnapshot(context, userIdFromUrl).catch(() => null)
+        ? await this._fetchCreatorSnapshot(context, userId).catch(() => null)
         : null;
-      if (creatorSnapshot?.profile && (!userIdFromUrl || creatorSnapshot.profile.unique_id === userIdFromUrl)) {
+      if (creatorSnapshot?.profile && userId && creatorSnapshot.profile.unique_id === userId) {
         Object.assign(profile, {
-          unique_id: creatorSnapshot.profile.unique_id || profile.unique_id,
           nickname: creatorSnapshot.profile.nickname || profile.nickname,
           avatar: creatorSnapshot.profile.avatar || profile.avatar,
           signature: creatorSnapshot.profile.signature || profile.signature,
-          follower_count: creatorSnapshot.profile.follower_count || profile.follower_count || 0,
-          following_count: creatorSnapshot.profile.following_count || profile.following_count || 0,
-          like_count: creatorSnapshot.profile.like_count || profile.like_count || 0
+          follower_count: profile.follower_count ?? creatorSnapshot.profile.follower_count,
+          following_count: profile.following_count ?? creatorSnapshot.profile.following_count,
+          like_count: profile.like_count ?? creatorSnapshot.profile.like_count
         });
       }
-      const isPublicLinkImport = options.useCreatorProfile === false;
-      const profileMatchesTarget = !userIdFromUrl || !profile.unique_id || profile.unique_id === userIdFromUrl;
-      if (isPublicLinkImport) {
-        if (!profileMatchesTarget) {
-          profile.unique_id = userIdFromUrl || profile.unique_id;
-          profile.follower_count = 0;
-          profile.following_count = 0;
-          profile.like_count = 0;
-        } else if (!userIdFromUrl) {
-          profile.follower_count = 0;
-          profile.following_count = 0;
-          profile.like_count = 0;
-        }
-      }
-      await page.close().catch(() => {});
-
-      const userId = userIdFromUrl || profile.unique_id;
-      if (!profile.nickname && !userId) {
-        return { success: false, error: '无法提取小红书账号信息，请使用用户主页链接或登录后重试' };
+      if (options.requireFollowerCount && profile.follower_count === undefined) {
+        return { success: false, error: '小红书主页未返回粉丝数，请稍后重试' };
       }
 
       return {
         success: true,
         data: {
-          unique_id: userId || `xhs_${Date.now()}`,
-          user_path: userId || null,
+          unique_id: userId,
+          user_path: userId,
           nickname: profile.nickname || '小红书用户',
           avatar: profile.avatar || '',
           signature: profile.signature || '',
-          follower_count: profile.follower_count || 0,
-          following_count: profile.following_count || 0,
-          like_count: profile.like_count || 0,
+          follower_count: profile.follower_count,
+          following_count: profile.following_count,
+          like_count: profile.like_count,
           verified: profile.verified ? 1 : 0
         }
       };
     } catch (error) {
-      await page.close().catch(() => {});
       return { success: false, error: error.message };
+    } finally {
+      await page.close().catch(() => {});
     }
   }
 
@@ -433,6 +437,11 @@ class XiaohongshuScraper {
         return { success: false, error: '小红书触发安全验证，请稍后再试', rateLimited: true, retryAfterMs: this.blockedUntil - Date.now() };
       }
 
+      if (this._extractUserId(page.url()) !== userId) {
+        await page.close().catch(() => {});
+        return { success: false, error: '小红书主页与目标账号不匹配' };
+      }
+
       const extracted = await this._collectRawNotesByBatches(page, userId, maxNotes, startDate, endDate);
 
       if (!extracted) {
@@ -446,9 +455,13 @@ class XiaohongshuScraper {
         return null;
       }) : null;
       if (creatorSnapshot?.profile) {
+        const { profile } = creatorSnapshot;
         extracted.profile = {
           ...(extracted.profile || {}),
-          ...creatorSnapshot.profile
+          ...profile,
+          follower_count: profile.follower_count ?? extracted.profile?.follower_count,
+          following_count: profile.following_count ?? extracted.profile?.following_count,
+          like_count: profile.like_count ?? extracted.profile?.like_count
         };
       }
       if (creatorSnapshot?.notes?.length) {
@@ -669,7 +682,7 @@ class XiaohongshuScraper {
   }
 
   async _extractProfileAndRawNotes(page, userId) {
-    return await page.evaluate((expectedUserId) => {
+    const result = await page.evaluate((expectedUserId) => {
         const state = window.__INITIAL_STATE__;
         if (!state || !state.user) return null;
 
@@ -693,15 +706,6 @@ class XiaohongshuScraper {
           return Math.round(num);
         };
         const firstPresent = (...values) => values.find((value) => value !== undefined && value !== null && value !== '');
-        const countField = (source, names) => {
-          if (!source || typeof source !== 'object') return 0;
-          for (const name of names) {
-            if (source[name] !== undefined && source[name] !== null && source[name] !== '') {
-              return parseCount(source[name]);
-            }
-          }
-          return 0;
-        };
         const readDomNotePlayCounts = () => {
           const result = {};
           const readLastCount = (text) => {
@@ -732,26 +736,15 @@ class XiaohongshuScraper {
         if (userPageData) {
           const basic = userPageData.basicInfo || userPageData.userInfo || {};
           const interactions = Array.isArray(userPageData.interactions) ? userPageData.interactions : [];
-          const getInteraction = (keywords) => {
-            const item = interactions.find((entry) => {
-              const label = String(entry.type || entry.name || entry.title || entry.label || '');
-              return keywords.some((keyword) => label.includes(keyword));
-            });
-            return item ? parseCount(item.count || item.value || item.num) : 0;
-          };
           const stats = userPageData.stats || userPageData.stat || userPageData.interactInfo || basic;
 
           profile = {
-            unique_id: basic.userId || basic.user_id || basic.redId || expectedUserId,
+            unique_id: basic.userId || basic.user_id || expectedUserId,
             nickname: basic.nickname || basic.nickName || basic.name || '',
             avatar: basic.avatar || basic.imageb || basic.images || '',
             signature: basic.desc || basic.description || '',
-            follower_count: getInteraction(['粉丝', 'fans', 'follower']) ||
-              countField(stats, ['fans', 'fansCount', 'fanCount', 'followerCount', 'followers', 'follower_count']),
-            following_count: getInteraction(['关注', 'follow']) ||
-              countField(stats, ['follows', 'followCount', 'followingCount', 'following_count']),
-            like_count: getInteraction(['获赞', '赞与收藏', 'liked', 'like']) ||
-              countField(stats, ['likedCount', 'likeCount', 'likes', 'liked_count']),
+            interactions,
+            stats,
             verified: !!(basic.verified || basic.redOfficialVerifyShowIcon)
           };
         }
@@ -816,6 +809,11 @@ class XiaohongshuScraper {
 
         return { profile, notes };
       }, userId);
+    if (result?.profile) {
+      const { interactions, stats, ...profile } = result.profile;
+      result.profile = profile.unique_id === userId ? { ...profile, ...parseProfileCounts(interactions, stats) } : null;
+    }
+    return result;
   }
 
   async getUserNotes(userId, maxCount = 50, cookies = null, startDate = null, endDate = null) {
@@ -1019,10 +1017,12 @@ class XiaohongshuScraper {
               userInfo?.basicInfo
             ) || '',
             signature: profileInfo.personal_desc || userInfo.userDesc || '',
-            follower_count: parseCount(firstPresent(profileInfo.fans_count, profileInfo.grow_info?.fans_count)),
-            following_count: parseCount(profileInfo.follow_count),
-            like_count: parseCount(profileInfo.faved_count),
             verified: 0
+          },
+          stats: {
+            follower_count: firstPresent(profileInfo.fans_count, profileInfo.grow_info?.fans_count),
+            following_count: profileInfo.follow_count,
+            liked_count: profileInfo.faved_count
           },
           notes: notes.filter((note) => note.note_id)
         };
@@ -1046,7 +1046,10 @@ class XiaohongshuScraper {
           title: snapshot.notes[0].title
         } : null
       });
-      return snapshot;
+      return {
+        profile: { ...snapshot.profile, ...parseProfileCounts([], snapshot.stats) },
+        notes: snapshot.notes
+      };
     } catch (error) {
       await page.close().catch(() => {});
       throw error;
@@ -1526,26 +1529,14 @@ class XiaohongshuScraper {
     return match ? match[1] : null;
   }
 
-  async _extractProfileFromPage(page, expectedUserId) {
-    return await page.evaluate((userId) => {
+  async _extractProfileFromPage(page) {
+    const { interactions, stats, ...profile } = await page.evaluate(() => {
       const state = window.__INITIAL_STATE__;
       const unwrap = (value) => {
         if (!value) return value;
         if (value.value !== undefined) return value.value;
         if (value._value !== undefined) return value._value;
         return value;
-      };
-      const parseCount = (value) => {
-        if (typeof value === 'number') return value;
-        if (!value) return 0;
-        const raw = String(value).replace(/,/g, '').replace(/[+＋\s]/g, '').trim();
-        const match = raw.match(/(\d+\.?\d*)/);
-        if (!match) return 0;
-        const num = parseFloat(match[1]);
-        if (raw.includes('亿')) return Math.round(num * 100000000);
-        if (raw.includes('万') || /w$/i.test(raw)) return Math.round(num * 10000);
-        if (raw.includes('千') || /k$/i.test(raw)) return Math.round(num * 1000);
-        return Math.round(num);
       };
       const extractAvatarCandidate = (...sources) => {
         const avatarKeys = [
@@ -1589,22 +1580,7 @@ class XiaohongshuScraper {
       const userPageData = unwrap(state?.user?.userPageData);
       const basic = userPageData?.basicInfo || userPageData?.userInfo || {};
       const interactions = Array.isArray(userPageData?.interactions) ? userPageData.interactions : [];
-      const getInteraction = (keywords) => {
-        const item = interactions.find((entry) => {
-          const label = String(entry.type || entry.name || entry.title || entry.label || '');
-          return keywords.some((keyword) => label.includes(keyword));
-        });
-        return item ? parseCount(item.count || item.value || item.num) : 0;
-      };
       const stats = userPageData?.stats || userPageData?.stat || userPageData?.interactInfo || basic;
-      const countField = (names) => {
-        for (const name of names) {
-          if (stats?.[name] !== undefined && stats?.[name] !== null && stats?.[name] !== '') {
-            return parseCount(stats[name]);
-          }
-        }
-        return 0;
-      };
       const normalizeImageUrl = (value) => {
         if (!value || typeof value !== 'string') return '';
         let raw = value.trim();
@@ -1651,18 +1627,15 @@ class XiaohongshuScraper {
         return '';
       };
       return {
-        unique_id: basic.userId || basic.user_id || basic.redId || userId,
+        unique_id: basic.userId || basic.user_id,
         nickname: basic.nickname || basic.nickName || document.title.replace(/-?\s*小红书.*/, '').trim(),
         avatar: extractAvatarCandidate(basic, userPageData, state) || readDomAvatar() || '',
         signature: basic.desc || basic.description || '',
-        follower_count: getInteraction(['粉丝', 'fans', 'follower']) ||
-          countField(['fans', 'fansCount', 'fanCount', 'followerCount', 'followers', 'follower_count']),
-        following_count: getInteraction(['关注', 'follow']) ||
-          countField(['follows', 'followCount', 'followingCount', 'following_count']),
-        like_count: getInteraction(['获赞', '赞与收藏', 'liked', 'like']) ||
-          countField(['likedCount', 'likeCount', 'likes', 'liked_count'])
+        interactions,
+        stats
       };
-    }, expectedUserId).catch(() => ({}));
+    }).catch(() => ({}));
+    return { ...profile, ...parseProfileCounts(interactions, stats) };
   }
 
   _parseCount(value) {

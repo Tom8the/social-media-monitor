@@ -6,6 +6,7 @@ const net = require('net');
 const { Proxy } = require('http-mitm-proxy');
 const { database } = require('./postgres-db');
 const VideohaoScraper = require('./videohao-scraper');
+const { saveVideohaoPosts } = require('./videohao-posts');
 
 const PLACEHOLDER_TITLE = '\u89c6\u9891\u53f7\u4f5c\u54c1\uff08\u5f85\u8865\u5168\uff09';
 const PLACEHOLDER_DESCRIPTION = '\u901a\u8fc7\u672c\u5730\u5fae\u4fe1\u91c7\u96c6\u5230\u7684\u89c6\u9891\uff0c\u6807\u9898\u548c\u53d1\u5e03\u65f6\u95f4\u5f85\u8865\u5168';
@@ -25,6 +26,11 @@ function parseCount(value) {
   if (raw.includes('万') || /w$/i.test(raw)) return Math.round(num * 10000);
   if (raw.includes('千') || /k$/i.test(raw)) return Math.round(num * 1000);
   return Math.round(num);
+}
+
+function parseCapturedCount(...values) {
+  const value = firstPresent(...values);
+  return value === undefined ? undefined : parseCount(value);
 }
 
 class VideohaoLocalProxy {
@@ -80,9 +86,11 @@ class VideohaoLocalProxy {
 
   async stop() {
     await this._closeProxyServer('stop');
-    await this.disableSystemProxy().catch(error => {
-      this._pushEvent('system:proxy-disable-on-stop-failed', { message: error.message });
-    });
+    if (process.platform === 'win32') {
+      await this.disableSystemProxy().catch(error => {
+        this._pushEvent('system:proxy-disable-on-stop-failed', { message: error.message });
+      });
+    }
     this.activeAccount = null;
     this._pushEvent('proxy:stopped', {});
     return { success: true };
@@ -1023,7 +1031,9 @@ class VideohaoLocalProxy {
         if (shouldInjectBridge) {
           ctx.proxyToClientResponse.write(this._injectBridgeScript(body));
         }
-        this._processCapture(ctx, body).finally(() => callback());
+        this._processCapture(ctx, body).catch(error => {
+          this._pushEvent('capture:response-failed', { message: error.message });
+        }).finally(() => callback());
       });
 
       return callback();
@@ -1708,19 +1718,20 @@ class VideohaoLocalProxy {
         cover_url: firstPresent(value.coverUrl, value.thumbUrl, media?.coverUrl, media?.thumbUrl, media?.fullCoverUrl) || '',
         video_url: firstPresent(value.videoUrl, value.url, media?.url, media?.fullUrl) || '',
         published_at: firstPresent(value.publishTime, value.createTime, value.timestamp, value.createtime),
-        play_count: parseCount(firstPresent(value.playCount, value.readCount, value.viewCount)),
-        like_count: parseCount(firstPresent(value.likeCount, value.likedCount, value.favCount)),
-        comment_count: parseCount(firstPresent(value.commentCount, value.comments)),
-        share_count: parseCount(firstPresent(value.shareCount, value.forwardCount, value.forwardAggregationCount)),
-        collect_count: parseCount(firstPresent(value.collectCount, value.favoriteCount, value.favCount)),
-        duration: parseCount(firstPresent(value.duration, media?.videoPlayLen))
+        play_count: parseCapturedCount(value.playCount, value.readCount, value.viewCount),
+        like_count: parseCapturedCount(value.likeCount, value.likedCount),
+        comment_count: parseCapturedCount(value.commentCount, value.comments),
+        share_count: parseCapturedCount(value.shareCount, value.forwardCount, value.forwardAggregationCount),
+        collect_count: parseCapturedCount(value.collectCount, value.favoriteCount, value.favCount),
+        duration: parseCapturedCount(value.duration, media?.videoPlayLen)
       });
     }, 7000);
     return posts;
   }
 
   async _savePosts(posts, sourceUrl) {
-    if (this.suppressPostPersistence || String(this.activeAccount?.id || '').startsWith('resolve-')) {
+    const account = this.activeAccount;
+    if (!account || this.suppressPostPersistence || String(account.id).startsWith('resolve-')) {
       return 0;
     }
 
@@ -1731,57 +1742,21 @@ class VideohaoLocalProxy {
       map.set(videoId, post);
     }
 
-    let saved = 0;
-    for (const rawPost of map.values()) {
+    const normalizedPosts = [...map.values()].map(rawPost => {
       const post = this._normalizePost(rawPost);
-      if (!post.video_id) continue;
-      const contentType = rawPost.content_type || post.content_type || 'video';
-      const existing = await database.getVideoById(post.video_id, 'videohao').catch(() => null);
-      const hasUsefulExisting = existing && Boolean(
-        existing.title || existing.description || existing.cover_url || existing.published_at
-      );
-      const incomingHasRealTitle = post.title && !this._isPlaceholderTitle(post.title);
-      const existingHasRealTitle = existing?.title && !this._isPlaceholderTitle(existing.title);
-      if (contentType === 'video_media' && hasUsefulExisting) {
-        post.title = existing.title || post.title;
-        post.description = existing.description || post.description;
-        post.cover_url = existing.cover_url || post.cover_url;
-        post.published_at = existing.published_at || post.published_at;
-        post.content_type = existing.content_type || 'video';
-      }
-      if (existing && !incomingHasRealTitle && existingHasRealTitle) {
-        post.title = existing.title || post.title;
-        post.description = existing.description || post.description;
-        post.cover_url = existing.cover_url || post.cover_url;
-        post.published_at = existing.published_at || post.published_at;
-      }
-      await database.upsertVideo({
-        account_id: this.activeAccount.id,
-        platform: 'videohao',
-        video_id: post.video_id,
-        content_type: contentType === 'video_media' && hasUsefulExisting
-          ? (existing.content_type || 'video')
-          : contentType,
+      return {
+        ...post,
         title: post.title || rawPost.title || '',
         description: post.description || rawPost.description || '',
         cover_url: post.cover_url || rawPost.cover_url || '',
-        video_url: post.video_url || rawPost.video_url || sourceUrl || '',
-        duration: post.duration || 0,
-        topic_tags: post.topic_tags || '',
-        play_count: post.play_count || 0,
-        like_count: post.like_count || 0,
-        comment_count: post.comment_count || 0,
-        share_count: post.share_count || 0,
-        collect_count: post.collect_count || 0,
-        published_at: post.published_at || null,
-        is_deleted: 0
-      });
-      saved++;
-    }
+        video_url: post.video_url || rawPost.video_url || ''
+      };
+    });
+    const { saved } = await saveVideohaoPosts(account.id, normalizedPosts, { sourceUrl });
 
     if (saved > 0) {
-      this.capturedCount += saved;
-      await database.updateAccount(this.activeAccount.id, {
+      if (this.activeAccount?.id === account.id) this.capturedCount += saved;
+      await database.updateAccount(account.id, {
         last_fetch_at: new Date().toISOString()
       }).catch(() => {});
     }
@@ -1805,12 +1780,12 @@ class VideohaoLocalProxy {
       description: String(rawPost.description || rawPost.title || '').trim(),
       cover_url: String(rawPost.cover_url || rawPost.coverUrl || rawPost.thumbUrl || '').trim(),
       video_url: String(rawPost.video_url || rawPost.videoUrl || rawPost.url || '').trim(),
-      duration: parseCount(rawPost.duration),
-      play_count: parseCount(rawPost.play_count || rawPost.playCount || rawPost.readCount),
-      like_count: parseCount(rawPost.like_count || rawPost.likeCount || rawPost.likedCount),
-      comment_count: parseCount(rawPost.comment_count || rawPost.commentCount),
-      share_count: parseCount(rawPost.share_count || rawPost.shareCount || rawPost.forwardCount),
-      collect_count: parseCount(rawPost.collect_count || rawPost.collectCount || rawPost.favoriteCount),
+      duration: parseCapturedCount(rawPost.duration),
+      play_count: parseCapturedCount(rawPost.play_count, rawPost.playCount, rawPost.readCount),
+      like_count: parseCapturedCount(rawPost.like_count, rawPost.likeCount, rawPost.likedCount),
+      comment_count: parseCapturedCount(rawPost.comment_count, rawPost.commentCount),
+      share_count: parseCapturedCount(rawPost.share_count, rawPost.shareCount, rawPost.forwardCount),
+      collect_count: parseCapturedCount(rawPost.collect_count, rawPost.collectCount, rawPost.favoriteCount),
       published_at: publishedAt,
       topic_tags: rawPost.topic_tags || this._extractTopicTags(rawPost.description || rawPost.title || '')
     };
@@ -1841,11 +1816,6 @@ class VideohaoLocalProxy {
     const matches = String(text || '').match(/#[^#\s]+/g) || [];
     return matches.map(tag => tag.replace(/^#/, '')).join(',');
   }
-  _isPlaceholderTitle(title) {
-    const raw = String(title || '').trim();
-    return !raw || raw === PLACEHOLDER_TITLE || raw.includes('待补全') || raw.includes('???');
-  }
-
   _walk(root, visitor, limit = 5000) {
     const queue = [root];
     const seen = new WeakSet();

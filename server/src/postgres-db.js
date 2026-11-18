@@ -17,6 +17,21 @@ function closeDatabase() {
   return pool.end();
 }
 
+async function withTransaction(operation) {
+  const connection = await pool.connect();
+  try {
+    await connection.query('BEGIN');
+    const result = await operation(connection);
+    await connection.query('COMMIT');
+    return result;
+  } catch (error) {
+    await connection.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
 const videoSortColumns = new Set([
   'id', 'account_id', 'platform_code', 'video_id', 'title', 'duration', 'content_type',
   'play_count', 'like_count', 'comment_count', 'share_count', 'collect_count', 'published_at',
@@ -77,16 +92,16 @@ const database = {
     return { id, ...account };
   },
 
-  async updateAccount(id, updates) {
+  async updateAccount(id, updates, connection = pool) {
     const fields = ['avatar', 'nickname', 'unique_id', 'sec_uid', 'follower_count', 'following_count',
-      'like_count', 'signature', 'cookie_data', 'status', 'last_fetch_at'];
+      'like_count', 'video_count', 'signature', 'cookie_data', 'status', 'last_fetch_at'];
     const params = [];
     const assignments = [];
     for (const field of fields) {
       if (updates[field] !== undefined) assignments.push(field + ' = $' + params.push(updates[field]));
     }
     if (!assignments.length) return null;
-    const { rows } = await pool.query(
+    const { rows } = await connection.query(
       'UPDATE accounts SET ' + assignments.join(', ') + ', updated_at = NOW() WHERE id = $' + params.push(id) + ' RETURNING *',
       params
     );
@@ -139,7 +154,7 @@ const database = {
     return rows[0].total;
   },
 
-  async upsertVideo(video) {
+  async upsertVideo(video, { requireSameAccount = false, connection = pool } = {}) {
     const accountId = video.account_id || video.accountId;
     if (!accountId) throw new Error('视频缺少 account_id，已拒绝入库');
     const publishedAt = Object.hasOwn(video, 'published_at') ? video.published_at :
@@ -154,9 +169,11 @@ const database = {
       'cover_url = EXCLUDED.cover_url, video_url = EXCLUDED.video_url, duration = EXCLUDED.duration, topic_tags = EXCLUDED.topic_tags,',
       'play_count = EXCLUDED.play_count, like_count = EXCLUDED.like_count, comment_count = EXCLUDED.comment_count,',
       'share_count = EXCLUDED.share_count, collect_count = EXCLUDED.collect_count, published_at = EXCLUDED.published_at,',
-      'fetched_at = NOW(), is_deleted = EXCLUDED.is_deleted, updated_at = NOW() RETURNING id'
+      'fetched_at = NOW(), is_deleted = EXCLUDED.is_deleted, updated_at = NOW()',
+      requireSameAccount ? 'WHERE videos.account_id = EXCLUDED.account_id' : '',
+      'RETURNING id'
     ].join(' ');
-    const { rows } = await pool.query(sql, [
+    const { rows } = await connection.query(sql, [
       uuidv4(), accountId, video.platform || video.platform_code || 'douyin', video.video_id || video.videoId || '',
       video.content_type || video.contentType || 'video', video.title || '', video.description || '',
       video.cover_url || video.coverUrl || '', video.video_url || video.videoUrl || '', video.duration || 0,
@@ -164,7 +181,10 @@ const database = {
       video.comment_count || video.commentCount || 0, video.share_count || video.shareCount || 0,
       video.collect_count || video.collectCount || 0, publishedAt, Number(video.is_deleted ?? 0)
     ]);
-    if (!rows.length) throw new Error('视频所属账号不存在，已拒绝入库: ' + accountId);
+    if (!rows.length) {
+      throw new Error(requireSameAccount ? '作品已归属其他账号或目标账号不存在：' + (video.video_id || video.videoId) :
+        '视频所属账号不存在，已拒绝入库: ' + accountId);
+    }
     return { ...video, id: rows[0].id };
   },
 
@@ -198,8 +218,8 @@ const database = {
     return rows;
   },
 
-  async getVideoById(videoId, platformCode) {
-    const { rows } = await pool.query('SELECT * FROM videos WHERE video_id = $1 AND platform_code = $2', [videoId, platformCode]);
+  async getVideoById(videoId, platformCode, connection = pool) {
+    const { rows } = await connection.query('SELECT * FROM videos WHERE video_id = $1 AND platform_code = $2', [videoId, platformCode]);
     return rows[0] || null;
   },
 
@@ -239,4 +259,4 @@ const database = {
   }
 };
 
-module.exports = { database, initDatabase, checkDatabase, closeDatabase };
+module.exports = { database, initDatabase, checkDatabase, closeDatabase, withTransaction };

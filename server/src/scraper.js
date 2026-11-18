@@ -1,6 +1,7 @@
 // 抖音数据采集服务 - 使用浏览器自动化
 const { chromium } = require('playwright');
 const path = require('path');
+const { startLoginDesktop } = require('./login-desktop');
 
 class DouyinScraper {
   constructor() {
@@ -12,7 +13,7 @@ class DouyinScraper {
       this.browser = await chromium.launch({
         channel: 'chrome',
         headless: true, // 使用无头模式，隐藏浏览器窗口
-        args: [
+        args: process.platform === 'linux' ? ['--no-sandbox', '--disable-quic'] : [
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-blink-features=AutomationControlled',
@@ -45,101 +46,104 @@ class DouyinScraper {
     return this.browser;
   }
 
+  async _openAuthorizedPage(cookies) {
+    let desktop;
+    let context;
+    const close = async () => {
+      try { await context?.close(); }
+      finally { await desktop?.close(); }
+    };
+    try {
+      if (process.platform === 'linux') {
+        const viewport = { width: 980, height: 760 };
+        desktop = await startLoginDesktop(viewport);
+        context = await chromium.launchPersistentContext(desktop.profile, {
+          channel: 'chrome', headless: false, env: desktop.env, viewport: null,
+          args: ['--no-proxy-server', '--kiosk', '--window-position=0,0', `--window-size=${viewport.width},${viewport.height}`, '--force-device-scale-factor=1']
+        });
+      } else {
+        const browser = await this.getBrowser();
+        context = await browser.newContext({ viewport: { width: 1280, height: 800 }, locale: 'zh-CN' });
+      }
+      await context.addCookies(cookies.map(cookie => ({
+        name: cookie.name,
+        value: cookie.value,
+        domain: cookie.domain,
+        path: cookie.path || '/',
+        expires: cookie.expires,
+        httpOnly: cookie.httpOnly,
+        secure: cookie.secure,
+        sameSite: cookie.sameSite,
+        partitionKey: cookie.partitionKey
+      })));
+      const page = context.pages()[0] || await context.newPage();
+      if (desktop) {
+        await page.bringToFront();
+        await desktop.focus();
+        // 先让抖音首页以已有授权初始化浏览器会话，再访问作品页。
+        await page.goto('https://www.douyin.com/', { waitUntil: 'commit', timeout: 20000 });
+        await page.waitForTimeout(6500);
+      }
+      return { page, close };
+    } catch (error) {
+      await close().catch(() => {});
+      throw error;
+    }
+  }
+
   // 使用保存的 Cookie 获取数据（深度授权账号同步用）
   // 返回值: { success, data, cookieExpired }
   async fetchWithCookies(userPath, cookies) {
-    let context = null;
+    let browserPage;
     try {
-      await this.init();
-      
-      // 创建带 Cookie 的上下文
-      context = await this.browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        viewport: { width: 1280, height: 800 },
-        locale: 'zh-CN',
-        extraHTTPHeaders: {
-          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
-        }
-      });
-      
-      // 添加保存的 Cookie
-      if (cookies && Array.isArray(cookies)) {
-        await context.addCookies(cookies.map(c => ({
-          name: c.name,
-          value: c.value,
-          domain: c.domain,
-          path: c.path || '/',
-          expires: c.expires
-        })));
-      }
-      
-      const page = await context.newPage();
+      browserPage = await this._openAuthorizedPage(Array.isArray(cookies) ? cookies : []);
+      const { page } = browserPage;
 
-      let userApiData = null;
-      page.on('response', async (response) => {
-        const respUrl = response.url();
-        if (respUrl.includes('/user/') ||
-            respUrl.includes('aweme/v1/web/user') ||
-            respUrl.includes('aweme/v1/user') ||
-            respUrl.includes('account/info') ||
-            respUrl.includes('user/profile') ||
-            (respUrl.includes('/api/') && respUrl.includes('user'))) {
-          try {
-            const apiData = await response.json();
-            const hasUserData = apiData?.user || apiData?.user_info || apiData?.author ||
-              apiData?.data?.user || apiData?.data?.author ||
-              apiData?.user_list?.[0]?.user;
-            if (hasUserData && !userApiData) {
-              userApiData = apiData;
-              console.log('[Scraper] Cookie模式捕获到用户资料API:', respUrl.substring(0, 100));
-            }
-          } catch (e) {}
-        }
-      });
-      
-      // 反检测脚本
-      await context.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        window.chrome = { runtime: {} };
-      });
+      let apiProfile = null;
+      const profileResponse = page.waitForResponse(async response => {
+        apiProfile = (await this._readProfileResponse(response, userPath)) || apiProfile;
+        return !!apiProfile;
+      }, { timeout: 24000 }).catch(() => null);
       
       const url = `https://www.douyin.com/user/${userPath}`;
       console.log('[Scraper] 使用 Cookie 访问:', url);
       
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForTimeout(5000);
-      await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      await page.goto(url, { waitUntil: 'commit', timeout: 25000 });
+      await profileResponse;
+      if (apiProfile) {
+        return { success: true, data: apiProfile, cookieExpired: false };
+      }
       
       // 检测Cookie是否失效：检查是否跳转到登录页或显示登录提示
       const cookieExpired = await this._checkCookieExpired(page);
       if (cookieExpired) {
         console.log('[Scraper] Cookie已失效，需要重新登录');
-        await context.close();
         return { success: false, error: 'Cookie已失效，请重新扫码登录', cookieExpired: true };
       }
       
       // 提取数据
       const data = await this._getDataFromDOM(page);
-      if (userApiData) {
-        const apiProfile = this._extractFromApiResponse(userApiData);
-        if (apiProfile) {
-          data.avatar = apiProfile.avatar || data.avatar;
-          data.follower_count = apiProfile.follower_count || data.follower_count || 0;
-          data.following_count = apiProfile.following_count || data.following_count || 0;
-          data.like_count = apiProfile.like_count || data.like_count || 0;
-          data.signature = apiProfile.signature || data.signature || '';
-          data.verified = apiProfile.verified || data.verified || 0;
-          data.nickname = apiProfile.nickname || data.nickname;
-        }
+      if (!data.nickname || !data.avatar) {
+        return { success: false, error: '未收到抖音账号资料，请稍后重试' };
       }
       
-      await context.close();
       return { success: true, data, cookieExpired: false };
     } catch (error) {
       console.error('[Scraper] fetchWithCookies 失败:', error.message);
-      if (context) { try { await context.close(); } catch(e) {} }
       return { success: false, error: error.message, cookieExpired: false };
+    } finally {
+      await browserPage?.close().catch(() => {});
     }
+  }
+
+  async _readProfileResponse(response, userPath) {
+    const url = new URL(response.url());
+    if (url.hostname !== 'www.douyin.com' || url.pathname !== '/aweme/v1/web/user/profile/other/' || !response.ok()) return null;
+    const data = await response.json().catch(() => null);
+    const user = data?.user;
+    if (data?.status_code !== 0 || !user) return null;
+    if (url.searchParams.get('sec_user_id') !== userPath && ![user.sec_uid, user.unique_id, user.short_id].includes(userPath)) return null;
+    return this._extractFromApiResponse(data);
   }
   
   // 检测Cookie是否失效
@@ -1492,189 +1496,128 @@ class DouyinScraper {
   }
 
   async getUserVideos(userPath, maxCount = 50, cookies = null, startDate = null, endDate = null) {
-    let context;
-    
-    if (cookies && cookies.length > 0) {
-      // 使用 Cookie 创建上下文
-      const browser = await this.getBrowser();
-      context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        viewport: { width: 1280, height: 800 },
-        locale: 'zh-CN'
-      });
-      
-      await context.addCookies(cookies.map(c => ({
-        name: c.name,
-        value: c.value,
-        domain: c.domain,
-        path: c.path || '/'
-      })));
-      
-      await context.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        window.chrome = { runtime: {} };
-      });
-      
-      console.log(`[Scraper] 使用 Cookie 获取视频列表: ${userPath}`);
-    } else {
-      context = await this.createContext();
-      console.log(`[Scraper] 获取视频列表 (无Cookie): ${userPath}`);
-    }
-    
-    // 时间范围参数日志
-    if (startDate || endDate) {
-      console.log(`[Scraper] 时间范围: ${startDate || '不限'} ~ ${endDate || '不限'}`);
-    }
-    
-    const page = await context.newPage();
-    
+    const authenticated = Array.isArray(cookies) && cookies.length > 0;
+    let closePage;
     try {
+      let page;
+      if (authenticated) {
+        const browserPage = await this._openAuthorizedPage(cookies);
+        page = browserPage.page;
+        closePage = browserPage.close;
+      } else {
+        const context = await this.createContext();
+        closePage = () => context.close();
+        page = await context.newPage();
+      }
       const url = `https://www.douyin.com/user/${userPath}`;
       
       // ========== 策略1：通过API拦截获取完整数据（含播放量） ==========
       // 抖音Web端不显示播放量，但内部API /aweme/v1/web/aweme/post/ 返回完整统计数据
-      let apiVideoData = []; // 从API收集的所有视频数据（不过滤时间）
-      let apiCaptured = false;
-      let shouldStopScrolling = false; // 是否应该停止滚动（已到达时间范围外）
-      
-      // 设置API响应拦截（必须在导航之前）
-      page.on('response', async (response) => {
-        const respUrl = response.url();
-        // 匹配用户视频列表API
-        if (respUrl.includes('/aweme/v1/web/aweme/post/') && response.status() === 200) {
-          try {
-            const contentType = response.headers()['content-type'] || '';
-            if (!contentType.includes('application/json')) return;
-            
-            const data = await response.json();
-            if (data && data.aweme_list && data.aweme_list.length > 0) {
-              // 验证视频是否属于目标用户（检查author信息）
-              const firstVideo = data.aweme_list[0];
-              const authorUid = firstVideo?.author?.sec_uid || firstVideo?.author?.unique_id || '';
-              console.log(`[Scraper] 捕获到视频列表API，包含 ${data.aweme_list.length} 个视频, author: ${authorUid.substring(0, 20)}`);
-              
-              // 如果API返回的视频属于其他用户（Cookie用户的视频），则跳过
-              if (userPath && authorUid && !authorUid.includes(userPath) && !userPath.includes(authorUid)) {
-                console.log(`[Scraper] API返回的视频不属于目标用户 ${userPath.substring(0, 20)}，跳过`);
-                return;
-              }
-              
-              apiCaptured = true;
-              
-              for (const item of data.aweme_list) {
-                try {
-                  const video = this._parseAwemeItem(item);
-                  if (video) {
-                    apiVideoData.push(video);
-                    
-                    // 检查是否已超出时间范围（用于提前停止滚动，但不丢弃数据）
-                    if (startDate && video.published_at && !shouldStopScrolling) {
-                      const pubDate = new Date(video.published_at);
-                      const start = new Date(startDate);
-                      if (pubDate < start) {
-                        // 标记停止滚动，但已收集的数据保留（后面统一过滤）
-                        shouldStopScrolling = true;
-                        console.log(`[Scraper] 检测到视频 ${video.video_id} 发布时间 ${video.published_at} 早于 ${startDate}，后续将停止滚动`);
-                      }
-                    }
-                  }
-                } catch (e) {
-                  console.log(`[Scraper] 解析视频项失败:`, e.message);
-                }
-              }
-            } else {
-              console.log(`[Scraper] 视频列表API返回空数据`);
-            }
-          } catch (e) {
-            // JSON解析失败，忽略
-          }
-        }
-      });
-      
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForTimeout(3000);
-      
-      // 如果使用了Cookie，检测是否失效
-      if (cookies && cookies.length > 0) {
-        const cookieExpired = await this._checkCookieExpired(page);
-        if (cookieExpired) {
-          console.log('[Scraper] Cookie已失效，需要重新登录');
-          await context.close();
-          return { success: false, error: 'Cookie已失效，请重新扫码登录', cookieExpired: true };
-        }
-      }
-      
-      // 关闭登录弹窗
-      await this._closeLoginModal(page);
-      
-      // 滚动加载更多视频，触发API分页请求
-      // 如果设置了时间范围且已到达时间范围外的视频，提前停止滚动
-      for (let i = 0; i < 15; i++) {
-        if (shouldStopScrolling) {
-          console.log(`[Scraper] 已到达时间范围边界，停止滚动`);
-          break;
-        }
-        if (apiVideoData.length >= maxCount) {
-          console.log(`[Scraper] 已收集 ${apiVideoData.length} 个视频，达到目标数量`);
-          break;
-        }
-        await page.evaluate(() => window.scrollBy(0, 1000));
-        await page.waitForTimeout(1500);
-      }
-      
-      // 等待API数据收集完成
-      await page.waitForTimeout(3000);
-      
-      // 去重（按video_id）
-      const seenIds = new Set();
-      const uniqueApiVideos = [];
-      for (const v of apiVideoData) {
-        if (!seenIds.has(v.video_id)) {
-          seenIds.add(v.video_id);
-          uniqueApiVideos.push(v);
-        }
-      }
-      
-      console.log(`[Scraper] API拦截获取到 ${uniqueApiVideos.length} 个视频（去重后）`);
-      
       // ========== 统一时间范围过滤 ==========
+      const start = startDate ? new Date(startDate) : null;
+      const end = endDate ? new Date(endDate) : null;
+      end?.setHours(23, 59, 59, 999);
       const filterByTimeRange = (videos) => {
-        if (!startDate && !endDate) return videos;
         return videos.filter(v => {
           if (!v.published_at) return true; // 没有发布时间的不过滤
           const pubDate = new Date(v.published_at);
-          if (startDate) {
-            const start = new Date(startDate);
-            start.setHours(0, 0, 0, 0);
-            if (pubDate < start) return false;
-          }
-          if (endDate) {
-            const end = new Date(endDate);
-            end.setHours(23, 59, 59, 999);
-            if (pubDate > end) return false;
-          }
-          return true;
+          return !(start && pubDate < start) && !(end && pubDate > end);
         });
       };
       
-      // 如果API拦截成功且数据充足，直接使用API数据
-      if (apiCaptured && uniqueApiVideos.length >= 5) {
-        // 先按时间范围过滤，再限制数量
-        const filtered = filterByTimeRange(uniqueApiVideos);
-        const result = filtered.slice(0, maxCount);
-        console.log(`[Scraper] 使用API数据，共 ${uniqueApiVideos.length} 个，时间过滤后 ${filtered.length} 个，返回 ${result.length} 个`);
-        
-        // 打印前3个视频的播放量用于验证
-        for (let i = 0; i < Math.min(3, result.length); i++) {
-          console.log(`[Scraper] 视频${i+1}: play=${result[i].play_count}, likes=${result[i].like_count}, title=${result[i].title?.substring(0, 30)}...`);
+      const posts = new Map();
+      let pageCount = 0;
+      let hasMore = true;
+      let ignored = false;
+      let accessDenied = false;
+      let profile;
+      let resolveFirstPage;
+      const firstPage = new Promise(resolve => { resolveFirstPage = resolve; });
+      page.on('response', async response => {
+        const requestUrl = new URL(response.url());
+        if (requestUrl.hostname !== 'www.douyin.com') return;
+        if (requestUrl.pathname === '/aweme/v1/web/user/profile/other/') {
+          profile = (await this._readProfileResponse(response, userPath)) || profile;
+          return;
         }
-        
-        await context.close();
-        return { success: true, data: result, cookieExpired: false };
+        if (requestUrl.pathname !== '/aweme/v1/web/aweme/post/') return;
+        const requestedUser = requestUrl.searchParams.get('sec_user_id');
+        if ([403, 429].includes(response.status()) && requestedUser === userPath) accessDenied = true;
+        if (response.status() !== 200) return;
+
+        const payload = await response.json().catch(() => null);
+        const items = payload?.aweme_list;
+        if (payload?.status_code !== 0 || !Array.isArray(items)) return;
+        const matches = items.filter(item =>
+          [item.author?.sec_uid, item.author?.unique_id, item.author?.short_id].includes(userPath)
+        );
+        if (!matches.length && (items.length || requestedUser !== userPath)) return;
+        if (!items.length && ![false, 0].includes(payload.has_more)) return;
+
+        for (const item of matches) {
+          const video = this._parseAwemeItem(item);
+          if (video) posts.set(video.video_id, video);
+          else ignored = true;
+        }
+        ignored ||= matches.length !== items.length;
+        hasMore = ![false, 0].includes(payload.has_more);
+        pageCount++;
+        resolveFirstPage(true);
+      });
+
+      await page.goto(url, { waitUntil: 'commit', timeout: 25000 });
+      let timer;
+      try {
+        await Promise.race([firstPage, new Promise(resolve => { timer = setTimeout(resolve, 24000); })]);
+      } finally {
+        clearTimeout(timer);
+      }
+
+      if (pageCount) {
+        let filtered = filterByTimeRange([...posts.values()]);
+        let idleScrolls = 0;
+        for (let i = 0; i < 12 && idleScrolls < 4 && hasMore && filtered.length < maxCount; i++) {
+          const previousPageCount = pageCount;
+          const lastPostId = [...posts.keys()].at(-1);
+          await page.evaluate(id => {
+            const links = document.querySelectorAll('a[href*="/video/"], a[href*="/note/"]');
+            const lastPost = [...links].find(link => new URL(link.href).pathname.endsWith(`/${id}`));
+            if (lastPost) lastPost.scrollIntoView({ block: 'end' });
+            else window.scrollBy(0, window.innerHeight);
+          }, lastPostId);
+          await page.waitForTimeout(1500);
+          idleScrolls = previousPageCount === pageCount ? idleScrolls + 1 : 0;
+          filtered = filterByTimeRange([...posts.values()]);
+          const pagesCoverStart = start && [...posts.values()].slice(-10).every(video =>
+            video.published_at && new Date(video.published_at) < start
+          );
+          if (pagesCoverStart && posts.size >= 10) break;
+        }
+        if (posts.size || (!hasMore && !ignored)) {
+          const data = filtered.slice(0, maxCount);
+          console.log(`[Scraper] 抖音作品采集: ${pageCount} 页，${posts.size} 条，筛选后返回 ${data.length} 条`);
+          return {
+            success: true,
+            data,
+            profile,
+            coverage: { deletionSafe: !hasMore && !ignored && filtered.length <= maxCount }
+          };
+        }
+      }
+
+      if (authenticated) {
+        if (await this._checkCookieExpired(page)) {
+          return { success: false, error: 'Cookie已失效，请重新扫码登录', cookieExpired: true };
+        }
+        return {
+          success: false,
+          error: accessDenied ? '抖音暂时拒绝了作品列表请求，请稍后重试' : '未收到抖音账号的作品列表，请稍后重试'
+        };
       }
       
       // ========== 策略2：DOM回退方案（无播放量，但能获取其他数据） ==========
-      console.log(`[Scraper] API拦截数据不足(${uniqueApiVideos.length}条)，使用DOM回退方案`);
+      await this._closeLoginModal(page);
+      console.log('[Scraper] 未收到作品列表，使用DOM回退方案');
       
       const videos = await page.evaluate(({ max, apiVideos }) => {
         const data = [];
@@ -1724,7 +1667,7 @@ class DouyinScraper {
         });
         
         return data;
-      }, { max: maxCount, apiVideos: uniqueApiVideos });
+      }, { max: maxCount, apiVideos: [...posts.values()] });
       
       console.log(`[Scraper] DOM获取到 ${videos.length} 个视频，开始获取详情数据...`);
       
@@ -1776,13 +1719,13 @@ class DouyinScraper {
       const filteredVideos = filterByTimeRange(videos);
       console.log(`[Scraper] DOM方案获取 ${videos.length} 个视频，时间过滤后 ${filteredVideos.length} 个`);
       
-      await context.close();
-      return { success: true, data: filteredVideos, cookieExpired: false };
+      return { success: true, data: filteredVideos, cookieExpired: false, coverage: { deletionSafe: false } };
       
     } catch (error) {
       console.error('[Scraper] 获取视频失败:', error.message);
-      await context.close();
       return { success: false, error: error.message, cookieExpired: false };
+    } finally {
+      await closePage?.().catch(() => {});
     }
   }
   
@@ -1825,12 +1768,7 @@ class DouyinScraper {
       
       // 发布时间（Unix时间戳 → 日期字符串）
       if (item.create_time) {
-        const date = new Date(item.create_time * 1000);
-        video.published_at = date.getFullYear() + '-' + 
-          String(date.getMonth() + 1).padStart(2, '0') + '-' + 
-          String(date.getDate()).padStart(2, '0') + ' ' + 
-          String(date.getHours()).padStart(2, '0') + ':' + 
-          String(date.getMinutes()).padStart(2, '0');
+        video.published_at = new Date(item.create_time * 1000).toISOString();
       }
       
       return video;

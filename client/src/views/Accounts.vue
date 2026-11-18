@@ -390,41 +390,32 @@
     <el-dialog
       v-model="globalCookieDialogVisible"
       :title="`${getPlatformName(globalCookiePlatform)}全局Cookie授权`"
-      width="420px"
+      width="min(980px, calc(100vw - 24px))"
+      top="4vh"
       :close-on-click-modal="false"
       class="cyber-dialog-light"
-      @close="closeGlobalCookieDialog"
+      @close="closeGlobalCookieDialog()"
     >
       <div class="global-cookie-dialog">
         <div v-if="globalCookieQrStatus === 'loading'" class="status-item">
           <el-icon :size="32" class="spin"><Loading /></el-icon>
           <p class="status-main">正在准备扫码登录...</p>
         </div>
-        <div v-else-if="globalCookieQrStatus === 'pending'" class="status-item">
-          <div class="status-icon pulse">
-            <el-icon :size="48" color="#00f0ff"><Cellphone /></el-icon>
-          </div>
-          <p class="status-main">请使用 {{ getPlatformName(globalCookiePlatform) }} APP 扫码</p>
-          <p class="status-sub">此授权仅用于公开监控采集，不会添加账号</p>
+        <div v-else-if="globalCookieQrStatus === 'pending' || globalCookieQrStatus === 'scanned'">
+          <p v-if="globalCookieQrStatus === 'scanned'" role="status">已扫码，请完成平台提示的验证并确认登录。</p>
+          <LoginSurface :key="globalCookieSessionId" :session-id="globalCookieSessionId" :platform="getPlatformName(globalCookiePlatform)" />
+          <el-button class="global-cookie-cancel" @click="globalCookieDialogVisible = false">取消授权</el-button>
         </div>
-        <div v-else-if="globalCookieQrStatus === 'scanned'" class="status-item">
-          <div class="status-icon pulse">
-            <el-icon :size="48" color="#00f0ff"><Loading /></el-icon>
-          </div>
-          <p class="status-main">已扫码，等待确认...</p>
-          <p class="status-sub">请在手机上确认登录</p>
+        <div v-else-if="globalCookieQrStatus === 'saving'" class="status-item">
+          <el-icon :size="32" class="spin"><Loading /></el-icon>
+          <p class="status-main">正在保存授权...</p>
         </div>
-        <div v-else-if="globalCookieQrStatus === 'confirmed'" class="status-item success">
-          <div class="status-icon">
-            <el-icon :size="48" color="#39ff14"><CircleCheckFilled /></el-icon>
-          </div>
-          <p class="status-main">授权成功</p>
-        </div>
-        <div v-else class="status-item error">
+        <div v-else-if="globalCookieQrStatus === 'error' || globalCookieQrStatus === 'expired'" class="status-item error">
           <div class="status-icon">
             <el-icon :size="48" color="#ff003c"><CircleCloseFilled /></el-icon>
           </div>
           <p class="status-main">{{ globalCookieQrStatus === 'expired' ? '二维码已过期' : '授权失败' }}</p>
+          <p v-if="globalCookieError" class="status-sub">{{ globalCookieError }}</p>
           <el-button class="cyber-btn-sm" @click="startGlobalCookieLogin(globalCookiePlatform)">
             <el-icon><Refresh /></el-icon> 重新扫码
           </el-button>
@@ -444,6 +435,7 @@ import {
 } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { accountApi } from '../api'
+import LoginSurface from './LoginSurface.vue'
 import { getAvatarUrl } from '../utils/media'
 
 const accounts = ref([])
@@ -474,7 +466,9 @@ const globalCookieDialogVisible = ref(false)
 const globalCookiePlatform = ref('douyin')
 const globalCookieSessionId = ref('')
 const globalCookieQrStatus = ref('')
-const globalCookiePollTimer = ref(null)
+const globalCookieError = ref('')
+let globalCookiePollTimer
+let globalCookieAttempt = 0
 const pendingGlobalCookieAction = ref(null)
 
 // 是否正在处理中（用于禁用按钮）
@@ -483,10 +477,11 @@ const isProcessing = computed(() => fetching.value || adding.value || generating
 const addMethod = ref('qrcode')
 const addMethods = computed(() => {
   if (selectedPlatform.value === 'videohao') {
-    return [
-      { value: 'qrcode', label: '扫码登录', icon: 'Cellphone' },
-      { value: 'url', label: '公开监控', icon: 'Search' }
-    ]
+    const methods = [{ value: 'url', label: '公开监控', icon: 'Search' }]
+    if (globalCookieStates.value.videohao?.mode === 'desktop-wechat') {
+      methods.unshift({ value: 'qrcode', label: '扫码登录', icon: 'Cellphone' })
+    }
+    return methods
   }
   return [
     { value: 'qrcode', label: '扫码登录', icon: 'Cellphone' },
@@ -577,7 +572,9 @@ const getShareUrlHint = () => {
     return '支持格式：小红书主页链接、分享卡片链接、账号名称'
   }
   if (selectedPlatform.value === 'videohao') {
-    return '需要桌面微信保持登录；系统会通过微信搜一搜解析账号并获取 finder_username'
+    return globalCookieStates.value.videohao?.mode === 'wx-channels-download'
+      ? '请在采集端登录微信并打开视频号页面，搜索名称或输入 Finder ID'
+      : '请保持桌面微信登录，搜索视频号名称或 ID'
   }
   return '支持格式：抖音主页链接、分享卡片链接'
 }
@@ -618,7 +615,7 @@ const getStatusText = (status) => {
 const getGlobalCookieTitle = (platform) => {
   if (platform === 'videohao') {
     const state = globalCookieStates.value.videohao
-    return `视频号桌面微信：${state?.hasCookie ? '已开启' : '未检测到或未登录'}。点击重新检测`
+    return `视频号采集：${state?.message || '等待检测'}。点击重新检测`
   }
   const state = globalCookieStates.value[platform]
   const status = state?.hasCookie ? '已获取' : '未授权或已失效'
@@ -635,28 +632,28 @@ const loadGlobalCookieStatus = async () => {
         ...(res.data.platforms || {})
       }
     }
-    await loadVideohaoDesktopStatus(false)
+    await loadVideohaoCaptureStatus(false)
   } catch (e) {
     console.error('加载全局Cookie状态失败', e)
   }
 }
 
-const loadVideohaoDesktopStatus = async (showMessage = true) => {
+const loadVideohaoCaptureStatus = async (showMessage = true) => {
   try {
-    const res = await accountApi.getVideohaoDesktopStatus()
+    const res = await accountApi.getVideohaoCaptureStatus()
     if (res.code === 0) {
       globalCookieStates.value = {
         ...globalCookieStates.value,
         videohao: res.data
       }
       if (showMessage) {
-        if (res.data.available) ElMessage.success('桌面微信已开启，可用于视频号公开监控')
-        else ElMessage.warning(res.data.message || '未检测到可用的桌面微信')
+        if (res.data.available) ElMessage.success(res.data.message || '视频号采集已连接')
+        else ElMessage.warning(res.data.message || '视频号采集尚未连接')
       }
       return res.data.available
     }
   } catch (e) {
-    if (showMessage) ElMessage.error('检测桌面微信失败：' + (e.response?.data?.message || e.message))
+    if (showMessage) ElMessage.error('检测视频号采集失败：' + (e.response?.data?.message || e.message))
   }
   return false
 }
@@ -692,14 +689,9 @@ const ensureXhsGlobalCookieForImport = async () => {
   return false
 }
 
-const ensureVideohaoGlobalCookieForSearch = async () => {
-  if (selectedPlatform.value !== 'videohao') return true
-  return loadVideohaoDesktopStatus(true)
-}
-
 const openGlobalCookieLogin = async (platform) => {
   if (platform === 'videohao') {
-    await loadVideohaoDesktopStatus(true)
+    await loadVideohaoCaptureStatus(true)
     return
   }
   const state = globalCookieStates.value[platform]
@@ -719,69 +711,69 @@ const openGlobalCookieLogin = async (platform) => {
 
 const startGlobalCookieLogin = async (platform) => {
   closeGlobalCookieDialog(false)
+  const attempt = globalCookieAttempt
   globalCookiePlatform.value = platform
   globalCookieDialogVisible.value = true
   globalCookieQrStatus.value = 'loading'
   try {
-    const res = await accountApi.generateQRCode({ platform })
-    if (res.code === 0) {
-      globalCookieSessionId.value = res.data.sessionId
-      globalCookieQrStatus.value = 'pending'
-      startGlobalCookiePolling()
-    } else {
-      globalCookieQrStatus.value = 'error'
-      ElMessage.error(res.message || '扫码登录打开失败')
+    const res = await accountApi.generateQRCode({ platform, purpose: 'global-cookie' })
+    if (attempt !== globalCookieAttempt) {
+      if (res.data?.sessionId) void accountApi.cancelLogin(res.data.sessionId).catch(() => {})
+      return
     }
+    if (res.code !== 0 || !res.data?.sessionId) throw new Error(res.message || '扫码登录打开失败')
+    globalCookieSessionId.value = res.data.sessionId
+    await pollGlobalCookie(attempt, platform)
   } catch (e) {
+    if (attempt !== globalCookieAttempt) return
     globalCookieQrStatus.value = 'error'
-    ElMessage.error('扫码登录打开失败：' + (e.response?.data?.message || e.message))
+    globalCookieError.value = e.response?.data?.message || e.message
   }
 }
 
-const startGlobalCookiePolling = () => {
-  clearInterval(globalCookiePollTimer.value)
-  globalCookiePollTimer.value = setInterval(async () => {
-    if (!globalCookieSessionId.value || ['confirmed', 'expired', 'error'].includes(globalCookieQrStatus.value)) {
-      clearInterval(globalCookiePollTimer.value)
+const pollGlobalCookie = async (attempt, platform) => {
+  const id = globalCookieSessionId.value
+  if (attempt !== globalCookieAttempt || !id) return
+  try {
+    const res = await accountApi.getQRCodeStatus(id)
+    if (attempt !== globalCookieAttempt) return
+    const { status, previewAvailable, error } = res.data
+    if (status === 'confirmed') {
+      globalCookieQrStatus.value = 'saving'
+      const saved = await accountApi.saveGlobalCookie({ platform, sessionId: id })
+      if (saved.code !== 0) throw new Error(saved.message || '保存授权失败，请重试')
+      await loadGlobalCookieStatus()
+      if (attempt !== globalCookieAttempt) return
+      ElMessage.success(`${getPlatformName(platform)}全局Cookie已更新`)
+      const nextAction = pendingGlobalCookieAction.value
+      globalCookieDialogVisible.value = false
+      closeGlobalCookieDialog()
+      if (nextAction) setTimeout(nextAction, 300)
       return
     }
-    try {
-      const res = await accountApi.getQRCodeStatus(globalCookieSessionId.value)
-      if (res.code !== 0) return
-      const newStatus = res.data.status
-      if (newStatus === globalCookieQrStatus.value) return
-      globalCookieQrStatus.value = newStatus
-      if (newStatus === 'scanned') {
-        ElMessage.info('已扫码，请在手机上确认')
-      } else if (newStatus === 'confirmed') {
-        clearInterval(globalCookiePollTimer.value)
-        const cookieData = res.data.cookieData || res.data.accountInfo?.cookie_data
-        if (!cookieData) {
-          globalCookieQrStatus.value = 'error'
-          ElMessage.warning('登录成功但未获取到Cookie，请重试')
-          return
-        }
-        await accountApi.saveGlobalCookie({ platform: globalCookiePlatform.value, cookieData })
-        await loadGlobalCookieStatus()
-        ElMessage.success(`${getPlatformName(globalCookiePlatform.value)}全局Cookie已更新`)
-        globalCookieDialogVisible.value = false
-        closeGlobalCookieDialog(false)
-        const nextAction = pendingGlobalCookieAction.value
-        pendingGlobalCookieAction.value = null
-        if (nextAction) setTimeout(nextAction, 300)
-      } else if (newStatus === 'expired') {
-        ElMessage.warning('二维码已过期，请重新扫码')
-      }
-    } catch (e) {
-      console.error('全局Cookie扫码状态查询失败', e)
+    globalCookieQrStatus.value = status === 'opening' || (status === 'pending' && !previewAvailable) ? 'loading' : status
+    if (status === 'expired' || status === 'error') {
+      globalCookieError.value = error || ''
+      return
     }
-  }, 2000)
+  } catch (e) {
+    if (attempt !== globalCookieAttempt) return
+    globalCookieQrStatus.value = e.response?.status === 404 ? 'expired' : 'error'
+    globalCookieError.value = globalCookieQrStatus.value === 'error' ? (e.response?.data?.message || e.message || '授权状态查询失败，请重试') : ''
+    return
+  }
+  globalCookiePollTimer = setTimeout(() => pollGlobalCookie(attempt, platform), 2000)
 }
 
 const closeGlobalCookieDialog = (clearPending = true) => {
-  clearInterval(globalCookiePollTimer.value)
+  globalCookieAttempt++
+  clearTimeout(globalCookiePollTimer)
+  if (globalCookieSessionId.value && globalCookieQrStatus.value !== 'saving') {
+    void accountApi.cancelLogin(globalCookieSessionId.value).catch(() => {})
+  }
   globalCookieSessionId.value = ''
   globalCookieQrStatus.value = ''
+  globalCookieError.value = ''
   if (clearPending) pendingGlobalCookieAction.value = null
 }
 
@@ -1062,39 +1054,24 @@ const resetQRCode = () => {
 }
 
 const handleSync = async (account) => {
+  if (account.syncing) return
   account.syncing = true
   try {
-    ElMessage.info(`正在更新 ${account.nickname} 的账号资料...`)
-    const res = await accountApi.profileSync(account.id)
+    ElMessage.info(`正在同步 ${account.nickname}...`)
+    const isVideohao = (account.platform_code || account.platform) === 'videohao'
+    const res = isVideohao ? await accountApi.sync(account.id) : await accountApi.profileSync(account.id)
     if (res.code === 0) {
-      ElMessage.success('账号资料已更新')
-      account.last_fetch_at = new Date().toISOString()
-      loadAccounts()
+      if (isVideohao && (res.data?.coverage?.hasMore || res.data?.coverage?.ignored)) {
+        ElMessage.warning(`已保存 ${res.data.saved} 条作品，部分作品未采集`)
+      } else {
+        ElMessage.success(isVideohao ? `已采集 ${res.data?.saved ?? 0} 条作品` : '账号资料已更新')
+      }
+      await loadAccounts()
     } else {
-      ElMessage.error(res.message || '账号资料更新失败')
+      ElMessage.error(res.message || '同步失败')
     }
   } catch (e) {
-    ElMessage.error('账号资料更新失败：' + (e.response?.data?.message || e.message))
-  } finally {
-    account.syncing = false
-  }
-}
-
-const startVideohaoLocalCapture = async (account) => {
-  account.syncing = true
-  try {
-    ElMessage.info(`正在通过桌面微信采集 ${account.nickname}...`)
-    const res = await accountApi.desktopVideohaoSync({ accountId: account.id, timeout: 45000 })
-    if (res.code !== 0) {
-      ElMessage.error(res.message || '视频号桌面微信采集失败')
-      return
-    }
-    const saved = Number(res.data?.saved) || 0
-    account.last_fetch_at = new Date().toISOString()
-    await loadAccounts()
-    ElMessage.success(saved > 0 ? `视频号桌面微信采集完成，账号资料已同步，新增/更新 ${saved} 条数据` : '视频号桌面微信采集完成，账号资料已同步，暂无新增数据')
-  } catch (e) {
-    ElMessage.error('视频号桌面微信采集失败：' + (e.response?.data?.message || e.message))
+    ElMessage.error('同步失败：' + (e.response?.data?.message || e.message))
   } finally {
     account.syncing = false
   }
@@ -1770,6 +1747,7 @@ onUnmounted(() => {
 .status-item.error .status-main { color: #DC2626; }
 .status-main { font-family: 'Orbitron', monospace; font-size: 16px; color: #0F172A; font-weight: 600; }
 .status-sub { font-size: 13px; color: #64748B; }
+.global-cookie-cancel { margin-top: 12px; }
 .status-timer { font-family: 'Orbitron', monospace; font-size: 12px; color: #0891B2; margin-top: 8px; }
 .status-icon { animation: none; }
 .status-icon.pulse { animation: pulse 1.5s ease-in-out infinite; }

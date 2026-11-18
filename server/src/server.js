@@ -1,18 +1,11 @@
 require('./load-env');
+require('./browser-temp');
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const { initDatabase, checkDatabase, closeDatabase } = require('./postgres-db');
 const videohaoLocalProxy = require('./videohao-local-proxy');
-
-// Playwright 在 Windows 上会先向系统临时目录写 artifacts。
-// 固定到项目目录，避免系统 Temp 权限或安全软件拦截导致 mkdtemp EPERM。
-const playwrightTmpDir = path.join(__dirname, '..', 'tmp', 'playwright');
-fs.mkdirSync(playwrightTmpDir, { recursive: true });
-process.env.TEMP = playwrightTmpDir;
-process.env.TMP = playwrightTmpDir;
-process.env.TMPDIR = playwrightTmpDir;
 
 const app = express();
 const PORT = process.env.PORT || 3000;

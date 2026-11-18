@@ -5,17 +5,16 @@ const fs = require('fs');
 const { database } = require('../postgres-db');
 const DouyinScraper = require('../scraper');
 const XiaohongshuScraper = require('../xhs-scraper');
-const VideohaoScraper = require('../videohao-scraper');
-const videohaoLocalProxy = require('../videohao-local-proxy');
+const videohao = require('../videohao-collector');
 const qrLoginService = require('../qr-login');
 const xhsQrLoginService = require('../xhs-qr-login');
 const videohaoQrLoginService = require('../videohao-qr-login');
+const { activeLoginPage, captureLoginPreview, validLoginInputs, sendLoginInputs, cancelLogin } = require('../login-preview');
 
 // 扫码登录会话存储（内存存储，生产环境应使用Redis）
 const qrSessions = new Map();
 const scraper = new DouyinScraper();
 const xhsScraper = new XiaohongshuScraper();
-const videohaoScraper = new VideohaoScraper();
 const SUPPORTED_QR_PLATFORMS = ['douyin', 'xiaohongshu', 'videohao'];
 
 // ========== 工具函数 ==========
@@ -160,45 +159,34 @@ async function runBatchSync(jobId, accounts, startDate = null, endDate = null) {
           await sleep(RATE_LIMIT.interval * (retries + 1));
         }
 
-        let profileData = null;
-        if (account.platform_code === 'douyin' && account.status === 'active' && account.cookie_data) {
-          try {
-            const cookies = JSON.parse(account.cookie_data);
-            const cookiePath = account.sec_uid || account.unique_id;
-            const cookieResult = await scraper.fetchWithCookies(cookiePath, cookies);
-            if (cookieResult.success && cookieResult.data) {
-              profileData = cookieResult.data;
-            }
-          } catch (cookieError) {
-            console.log(`[BatchSync] Cookie 失败，回退公开模式: ${account.nickname}`);
-          }
+        if (account.platform_code === 'videohao') {
+          const result = await videohao.sync(account, { startDate, endDate });
+          success = true;
+          job.completed++;
+          job.results.push({
+            accountId: account.id,
+            nickname: account.nickname,
+            success: true,
+            videosAdded: result.addedCount ?? null,
+            saved: result.saved,
+            coverage: result.coverage
+          });
+          break;
         }
 
-        if (account.platform_code === 'douyin' && !profileData) {
-          const userPath = account.unique_id || account.sec_uid;
-          if (userPath) {
-            const profileResult = await scraper.fetchFromLink(`https://www.douyin.com/user/${userPath}`);
-            if (profileResult.success && profileResult.data) {
-              profileData = profileResult.data;
-            }
-          }
-        }
-
-        if (profileData) {
-          const updates = { last_fetch_at: new Date().toISOString() };
-          if (profileData.avatar) updates.avatar = profileData.avatar;
-          if (profileData.follower_count !== undefined) updates.follower_count = profileData.follower_count;
-          if (profileData.following_count !== undefined) updates.following_count = profileData.following_count;
-          if (profileData.like_count !== undefined) updates.like_count = profileData.like_count;
-          if (profileData.nickname) updates.nickname = profileData.nickname;
-          await database.updateAccount(account.id, updates);
-        }
-
-        // 使用 Cookie 获取视频（如果有）
         let cookies = null;
         if (account.cookie_data) {
           try { cookies = JSON.parse(account.cookie_data); } catch (e) {}
         }
+
+        let profileData = null;
+        if (account.platform_code === 'douyin') {
+          cookies ||= await getParsedCookieForPlatform('douyin');
+          if (account.status === 'public' && !cookies?.length) {
+            throw Object.assign(new Error('请先扫码获取抖音全局Cookie'), { status: 401 });
+          }
+        }
+
         const persistBatchVideo = async (video, stage = 'final') => {
           const existing = await database.getVideoById(video.video_id, account.platform_code);
           let publishedAt = video.published_at
@@ -292,37 +280,16 @@ async function runBatchSync(jobId, accounts, startDate = null, endDate = null) {
           } else {
             videosResult = { success: false, data: [], error: combinedResult.error };
           }
-        } else if (account.platform_code === 'videohao') {
-          if (account.status === 'public') {
-            videosResult = {
-              success: false,
-              skipped: true,
-              data: [],
-              error: '公开视频号请使用桌面微信采集'
-            };
-            throw new Error(videosResult.error);
-          }
-          let videohaoAuthState = cookies;
-          const targetVideohaoId = account.sec_uid || account.unique_id;
-          const videohaoOptions = {};
-          const combinedResult = await videohaoScraper.fetchProfileAndPosts(targetVideohaoId, videohaoAuthState, 50, startDate, endDate, videohaoOptions);
-          if (combinedResult.success && combinedResult.data) {
-            profileData = combinedResult.data.profile || profileData;
-            videosResult = { success: true, data: combinedResult.data.posts || [], coverage: combinedResult.data.coverage || null };
-            if (profileData) {
-              const updates = { last_fetch_at: new Date().toISOString() };
-              if (profileData.avatar) updates.avatar = profileData.avatar;
-              if (profileData.follower_count !== undefined) updates.follower_count = profileData.follower_count;
-              if (profileData.following_count !== undefined) updates.following_count = profileData.following_count;
-              if (profileData.like_count !== undefined) updates.like_count = profileData.like_count;
-              if (profileData.nickname) updates.nickname = profileData.nickname;
-              await database.updateAccount(account.id, updates);
-            }
-          } else {
-            videosResult = combinedResult;
-          }
         } else {
           videosResult = await scraper.getUserVideos(account.sec_uid || account.unique_id, 50, cookies, startDate, endDate);
+          if (!videosResult.success) {
+            throw Object.assign(new Error(videosResult.error || '抖音作品采集失败'), {
+              status: videosResult.cookieExpired ? 401 : 502
+            });
+          }
+          if (videosResult.profile) {
+            await database.updateAccount(account.id, buildAccountProfileUpdates(videosResult.profile, account.platform_code));
+          }
         }
         let addedCount = 0;
 
@@ -370,6 +337,8 @@ async function runBatchSync(jobId, accounts, startDate = null, endDate = null) {
       } catch (error) {
         retries++;
         errorMsg = error.message;
+        if (account.platform_code === 'douyin' && error.status === 401) break;
+        if (account.platform_code === 'videohao' && [400, 401, 422, 503].includes(error.status)) break;
         console.log(`[BatchSync] 采集失败 (${retries}/${RATE_LIMIT.maxRetries}): ${account.nickname} - ${error.message}`);
       }
     }
@@ -492,7 +461,7 @@ router.put('/:id', async (req, res) => {
 // 1. 生成二维码 - 真实扫码登录
 router.post('/qr-code/generate', async (req, res) => {
   try {
-    const { platform = 'douyin' } = req.body;
+    const { platform = 'douyin', purpose } = req.body;
 
     if (!SUPPORTED_QR_PLATFORMS.includes(platform)) {
       return res.status(400).json({
@@ -500,12 +469,15 @@ router.post('/qr-code/generate', async (req, res) => {
         message: '扫码登录目前支持抖音、小红书和视频号'
       });
     }
+    if (platform === 'videohao' && videohao.mode !== 'desktop-wechat') {
+      return res.status(409).json({ code: 409, message: '请在下载器所在的微信客户端扫码，并打开视频号页面' });
+    }
 
     // 创建真实的扫码登录会话
     const loginService = platform === 'xiaohongshu'
       ? xhsQrLoginService
       : (platform === 'videohao' ? videohaoQrLoginService : qrLoginService);
-    const result = await loginService.createSession();
+    const result = await loginService.createSession({ globalCookie: purpose === 'global-cookie' && platform !== 'videohao' });
 
     if (result.error) {
       return res.status(500).json({ code: 500, message: result.error });
@@ -517,7 +489,8 @@ router.post('/qr-code/generate', async (req, res) => {
       data: {
         sessionId: result.sessionId,
         qrCode: result.qrCode,
-        expiresIn: 300
+        status: result.status,
+        expiresIn: result.expiresAt ? Math.max(0, Math.ceil((result.expiresAt - Date.now()) / 1000)) : 300
       }
     });
   } catch (error) {
@@ -533,14 +506,14 @@ router.get('/qr-code/status/:sessionId', async (req, res) => {
 
     // 先从真实扫码服务查询
     let session = qrLoginService.getSessionStatus(sessionId);
-    if (session.error) {
+    if (!session.sessionId) {
       session = xhsQrLoginService.getSessionStatus(sessionId);
     }
-    if (session.error) {
+    if (!session.sessionId) {
       session = videohaoQrLoginService.getSessionStatus(sessionId);
     }
 
-    if (session.error) {
+    if (!session.sessionId) {
       // 如果新服务找不到，尝试从旧的模拟会话查询
       const oldSession = qrSessions.get(sessionId);
       if (!oldSession) {
@@ -562,14 +535,54 @@ router.get('/qr-code/status/:sessionId', async (req, res) => {
       data: {
         sessionId: session.sessionId,
         status: session.status,
-        accountInfo: session.userData,
-        cookieData: session.cookieData,
+        qrCode: session.qrCode,
+        previewAvailable: !!activeLoginPage(findInteractiveLogin(sessionId)?.session),
+        accountInfo: session.globalCookie ? null : session.userData,
+        cookieData: session.globalCookie ? null : session.cookieData,
         error: session.error
       }
     });
   } catch (error) {
     res.status(500).json({ code: 500, message: error.message });
   }
+});
+
+function findInteractiveLogin(sessionId) {
+  for (const service of [qrLoginService, xhsQrLoginService]) {
+    const session = service.sessions.get(sessionId);
+    if (session?.globalCookie) return { service, session };
+  }
+  return null;
+}
+
+router.get('/qr-code/preview/:sessionId', async (req, res) => {
+  res.set('Cache-Control', 'private, no-store');
+  try {
+    const image = await captureLoginPreview(findInteractiveLogin(req.params.sessionId)?.session);
+    if (image) return res.type('jpeg').send(image);
+  } catch {
+    // A platform navigation may interrupt a frame. The viewer requests the next frame.
+  }
+  res.status(404).json({ code: 404, message: '登录画面暂不可用' });
+});
+
+router.post('/qr-code/input/:sessionId', async (req, res) => {
+  const events = req.body?.events;
+  if (!validLoginInputs(events)) return res.status(400).json({ code: 400, message: '登录操作无效' });
+  try {
+    if (!await sendLoginInputs(findInteractiveLogin(req.params.sessionId)?.session, events)) {
+      return res.status(404).json({ code: 404, message: '登录会话已结束' });
+    }
+    res.json({ code: 0 });
+  } catch {
+    res.status(409).json({ code: 409, message: '登录页面正在更新，请重试操作' });
+  }
+});
+
+router.delete('/qr-code/session/:sessionId', async (req, res) => {
+  const login = findInteractiveLogin(req.params.sessionId);
+  if (login) await cancelLogin(login.service, req.params.sessionId);
+  res.json({ code: 0 });
 });
 
 // 3. 模拟扫码（用于演示）
@@ -703,25 +716,28 @@ router.post('/videohao/search-accounts', async (req, res) => {
       return res.status(400).json({ code: 400, message: '请输入视频号名称或ID' });
     }
 
-    const result = await videohaoLocalProxy.resolvePublicAccountByDesktopWeChat(keyword, {
-      timeout: Number(req.body.timeout) || 25000
+    const list = await videohao.search(keyword, {
+      timeout: Math.min(45000, Math.max(1000, Number(req.body.timeout) || 25000)),
+      pageSize: Math.min(30, Math.max(1, Number.parseInt(req.body.pageSize, 10) || 10))
     });
-    if (!result.success) {
-      return res.status(502).json({ code: 502, message: result.error || '视频号账号搜索失败' });
-    }
 
     res.json({
       code: 0,
       message: 'success',
       data: {
-        list: [result.data],
-        total: 1
+        list,
+        total: list.length
       }
     });
   } catch (error) {
-    console.error('[VideohaoSearch] failed:', error);
-    res.status(500).json({ code: 500, message: error.message });
+    const status = error.status || 500;
+    if (status === 500) console.error('[VideohaoSearch] failed:', error);
+    res.status(status).json({ code: status, message: error.message });
   }
+});
+
+router.get('/videohao/status', async (_req, res) => {
+  res.json({ code: 0, data: await videohao.status() });
 });
 
 router.post('/fetch-from-url', async (req, res) => {
@@ -1034,6 +1050,15 @@ router.post('/:id/sync', async (req, res) => {
       return res.status(404).json({ code: 404, message: '账号不存在' });
     }
 
+    if (account.platform_code === 'videohao') {
+      const data = await videohao.sync(account, {
+        startDate,
+        endDate,
+        timeout: Math.min(45000, Math.max(1000, Number(req.body?.timeout) || 30000))
+      });
+      return res.json({ code: 0, message: '视频号采集完成', data });
+    }
+
     if (account.platform_code === 'xiaohongshu') {
       console.log('[XHS-Sync] start:', {
         accountId,
@@ -1047,8 +1072,8 @@ router.post('/:id/sync', async (req, res) => {
       });
     }
 
-    // 公开监控账号：除视频号外，仍需要对应平台全局Cookie。视频号公开监控使用桌面微信采集。
-    if (account.status === 'public' && account.platform_code !== 'videohao') {
+    // 公开监控账号使用对应平台的全局 Cookie。
+    if (account.status === 'public') {
       const globalCookie = await getGlobalCookie(account.platform_code);
       if (!globalCookie || !globalCookie.cookieData) {
         console.log('[Sync] 公开账号无有效全局Cookie，需要扫码登录');
@@ -1060,110 +1085,23 @@ router.post('/:id/sync', async (req, res) => {
       }
     }
 
-    // 1. 重新获取用户资料（头像、粉丝数等）
     let profileUpdated = false;
     let profileData = null;
-    
-    try {
-      // 深度授权账号：使用保存的 Cookie 获取数据
-      if (account.platform_code === 'douyin' && account.status === 'active' && account.cookie_data) {
-        console.log('[Sync] 使用保存的 Cookie 同步深度授权账号:', account.nickname);
-        try {
-          const cookies = JSON.parse(account.cookie_data);
-          const userPath = account.sec_uid || account.unique_id;
-          const cookieResult = await scraper.fetchWithCookies(userPath, cookies);
-          if (cookieResult.success && cookieResult.data) {
-            profileData = cookieResult.data;
-          }
-        } catch (cookieError) {
-          console.log('[Sync] Cookie 同步失败，回退到公开模式:', cookieError.message);
-        }
-      }
-      
-      // 公开监控账号：尝试使用全局Cookie获取资料
-      const globalCookie = await getGlobalCookie(account.platform_code);
-      if (account.platform_code === 'douyin' && !profileData && globalCookie && globalCookie.cookieData) {
-        try {
-          const cookies = JSON.parse(globalCookie.cookieData);
-          const userPath = account.sec_uid || account.unique_id;
-          console.log('[Sync] 使用全局Cookie获取公开账号资料:', account.nickname);
-          const cookieResult = await scraper.fetchWithCookies(userPath, cookies);
-          if (cookieResult.cookieExpired) {
-            // Cookie失效，标记并返回错误
-            await invalidateGlobalCookie(account.platform_code);
-            return res.status(401).json({ 
-              code: 401, 
-              message: 'Cookie已失效，请重新扫码登录',
-              data: { needRelogin: true }
-            });
-          }
-          if (cookieResult.success && cookieResult.data) {
-            profileData = cookieResult.data;
-          }
-        } catch (e) {
-          console.log('[Sync] 全局Cookie获取资料失败:', e.message);
-        }
-      }
-      
-      // 如果 Cookie 方式失败或无 Cookie，使用公开模式（仅限深度授权账号）
-      if (account.platform_code === 'douyin' && !profileData && account.status === 'active') {
-        const userPath = account.unique_id || account.sec_uid;
-        if (userPath) {
-          const profileResult = await scraper.fetchFromLink(`https://www.douyin.com/user/${userPath}`);
-          if (profileResult.success && profileResult.data) {
-            profileData = profileResult.data;
-          }
-        }
-      }
-      
-      if (profileData) {
-        // 更新账号资料
-        const updates = {
-          last_fetch_at: new Date().toISOString()
-        };
-        
-        // 如果获取到了新数据，更新字段
-        if (profileData.avatar) {
-          updates.avatar = profileData.avatar;
-        }
-        if (profileData.follower_count !== undefined) {
-          updates.follower_count = profileData.follower_count;
-        }
-        if (profileData.following_count !== undefined) {
-          updates.following_count = profileData.following_count;
-        }
-        if (profileData.like_count !== undefined) {
-          updates.like_count = profileData.like_count;
-        }
-        if (profileData.nickname) {
-          updates.nickname = profileData.nickname;
-        }
-        
-        await database.updateAccount(accountId, updates);
-        profileUpdated = true;
-      }
-    } catch (profileError) {
-      console.log('[Sync] 获取用户资料失败:', profileError.message);
-      // 继续同步视频，不阻断流程
-    }
 
-    // 2. 采集视频数据（优先使用账号Cookie；公开视频号不使用全局Cookie，改走桌面微信接口）
+    // 2. 采集视频数据（优先使用账号 Cookie）
     const videoUserPath = account.sec_uid || account.unique_id;
     let syncCookies = null;
     let usedGlobalCookie = false;
     if (account.cookie_data) {
       try { syncCookies = JSON.parse(account.cookie_data); } catch (e) {}
     }
-    if (account.platform_code !== 'videohao') {
-      // 公开监控账号：使用全局Cookie
-      const videoGlobalCookie = await getGlobalCookie(account.platform_code);
-      console.log('[Sync] 全局Cookie状态:', { hasGlobalCookie: !!videoGlobalCookie, hasCookieData: !!(videoGlobalCookie && videoGlobalCookie.cookieData) });
-      if (!syncCookies && videoGlobalCookie && videoGlobalCookie.cookieData) {
-        try { syncCookies = JSON.parse(videoGlobalCookie.cookieData); } catch (e) {}
-        if (syncCookies) {
-          usedGlobalCookie = true;
-          console.log('[Sync] 使用全局Cookie采集公开账号:', account.nickname);
-        }
+    const videoGlobalCookie = await getGlobalCookie(account.platform_code);
+    console.log('[Sync] 全局Cookie状态:', { hasGlobalCookie: !!videoGlobalCookie, hasCookieData: !!(videoGlobalCookie && videoGlobalCookie.cookieData) });
+    if (!syncCookies && videoGlobalCookie && videoGlobalCookie.cookieData) {
+      try { syncCookies = JSON.parse(videoGlobalCookie.cookieData); } catch (e) {}
+      if (syncCookies) {
+        usedGlobalCookie = true;
+        console.log('[Sync] 使用全局Cookie采集公开账号:', account.nickname);
       }
     }
     // 传递时间范围参数给scraper，让其在采集时就过滤
@@ -1284,38 +1222,16 @@ router.post('/:id/sync', async (req, res) => {
       } else {
         videosResult = { success: false, data: [], error: combinedResult.error };
       }
-    } else if (account.platform_code === 'videohao') {
-      const targetVideohaoId = account.sec_uid || account.unique_id;
-      const videohaoOptions = account.status === 'public'
-        ? { targetUrl: `https://channels.weixin.qq.com/web/pages/profile?username=${encodeURIComponent(targetVideohaoId)}` }
-        : {};
-      const combinedResult = await videohaoScraper.fetchProfileAndPosts(targetVideohaoId, syncCookies, 50, startDate, endDate, videohaoOptions);
-      if (combinedResult.busy) {
-        return res.status(409).json({
-          code: 409,
-          message: combinedResult.error || '该视频号账号正在采集中，请稍后再试'
-        });
-      }
-      if (combinedResult.cookieExpired && usedGlobalCookie) {
-        await invalidateGlobalCookie(account.platform_code);
-        return res.status(401).json({ code: 401, message: 'Cookie已失效，请重新扫码登录', data: { needRelogin: true } });
-      }
-      if (combinedResult.success && combinedResult.data) {
-        profileData = combinedResult.data.profile || profileData;
-        videosResult = {
-          success: true,
-          data: combinedResult.data.posts || [],
-          cookieExpired: false,
-          coverage: combinedResult.data.coverage || null
-        };
-      } else {
-        videosResult = { success: false, data: [], error: combinedResult.error };
-      }
     } else {
       videosResult = await scraper.getUserVideos(videoUserPath, 50, syncCookies, startDate, endDate);
+      if (videosResult.profile) {
+        profileData = videosResult.profile;
+        await database.updateAccount(accountId, buildAccountProfileUpdates(profileData, account.platform_code));
+        profileUpdated = true;
+      }
     }
 
-    if ((account.platform_code === 'xiaohongshu' || account.platform_code === 'videohao') && profileData && !profileUpdated) {
+    if ((account.platform_code === 'xiaohongshu') && profileData && !profileUpdated) {
       const updates = { last_fetch_at: new Date().toISOString() };
       if (profileData.avatar) updates.avatar = profileData.avatar;
       if (profileData.follower_count !== undefined) updates.follower_count = profileData.follower_count;
@@ -1337,17 +1253,19 @@ router.post('/:id/sync', async (req, res) => {
       });
     }
 
-    if (!videosResult.success && (account.platform_code === 'xiaohongshu' || account.platform_code === 'videohao')) {
-      console.log('[XHS-Sync] failed:', {
+    if (!videosResult.success) {
+      console.log('[Sync] 作品采集失败:', {
         accountId,
         nickname: account.nickname,
         error: videosResult.error || 'unknown'
       });
-      return res.status(502).json({
-        code: 502,
+      const status = videosResult.cookieExpired ? 401 : 502;
+      return res.status(status).json({
+        code: status,
         message: videosResult.error || '内容采集失败',
         data: {
-          rateLimited: !!videosResult.rateLimited
+          rateLimited: !!videosResult.rateLimited,
+          needRelogin: !!videosResult.cookieExpired
         }
       });
     }
@@ -1397,7 +1315,7 @@ router.post('/:id/sync', async (req, res) => {
       }
       
       // 小红书/视频号先保存本次抓到的全部内容，避免真实发布时间落在筛选范围外时，旧的错误发布时间无法被修正。
-      const videosToSave = (account.platform_code === 'xiaohongshu' || account.platform_code === 'videohao') ? videosResult.data : filteredVideos;
+      const videosToSave = (account.platform_code === 'xiaohongshu') ? videosResult.data : filteredVideos;
 
       // 1. 更新或新增视频
       for (const video of videosToSave) {
@@ -1470,9 +1388,9 @@ router.post('/:id/sync', async (req, res) => {
       // 避免因采集数量限制（只抓20条）导致误删
       try {
         const dbVideos = await database.getVideosByAccount(account.id);
-        const canMarkDeleted = !['xiaohongshu', 'videohao'].includes(account.platform_code) || !!videosResult.coverage?.deletionSafe;
+        const canMarkDeleted = !!videosResult.coverage?.deletionSafe;
         if (!canMarkDeleted) {
-          console.log('[XHS-Sync] skip delete marking: coverage not safe', {
+          console.log('[Sync] 作品覆盖不完整，跳过删除标记:', {
             accountId,
             coverage: videosResult.coverage || null,
             startDate: startDate || null,
@@ -1533,7 +1451,8 @@ router.post('/:id/sync', async (req, res) => {
     });
 
   } catch (error) {
-    res.status(500).json({ code: 500, message: error.message });
+    const status = error.status || 500;
+    res.status(status).json({ code: status, message: error.message, data: { needRelogin: status === 401 } });
   }
 });
 
@@ -1541,6 +1460,7 @@ router.post('/:id/sync', async (req, res) => {
 router.get('/qr-code/image/:sessionId', (req, res) => {
   try {
     const { sessionId } = req.params;
+    res.set('Cache-Control', 'private, no-store');
     const qrPath = qrLoginService.getQRImagePath(sessionId);
 
     if (!qrPath || !fs.existsSync(qrPath)) {
@@ -1631,7 +1551,10 @@ async function fetchAccountProfileOnly(account) {
       return { success: false, status: 401, message: '请先扫码获取小红书全局Cookie', data: { needRelogin: true } };
     }
     const url = `https://www.xiaohongshu.com/user/profile/${account.unique_id}`;
-    const result = await xhsScraper.fetchFromLink(url, cookies, { useCreatorProfile: account.status === 'active' });
+    const result = await xhsScraper.fetchFromLink(url, cookies, {
+      useCreatorProfile: account.status === 'active',
+      requireFollowerCount: true
+    });
     if (result.cookieExpired) {
       await invalidateGlobalCookie('xiaohongshu');
       return { success: false, status: 401, message: '小红书Cookie已失效，请重新扫码登录', data: { needRelogin: true } };
@@ -1642,22 +1565,11 @@ async function fetchAccountProfileOnly(account) {
   }
 
   if (platform === 'videohao') {
-    if (account.status === 'public') {
-      const result = await videohaoLocalProxy.resolvePublicAccountByDesktopWeChat(account.nickname || account.unique_id, {
-        timeout: 25000
-      });
-      return result.success
-        ? { success: true, profileData: result.data || {} }
-        : { success: false, status: 502, message: result.error || '视频号账号资料同步失败' };
+    try {
+      return { success: true, profileData: await videohao.profile(account) };
+    } catch (error) {
+      return { success: false, status: error.status || 500, message: error.message, data: { needRelogin: error.status === 401 } };
     }
-    const authState = account.cookie_data ? (() => { try { return JSON.parse(account.cookie_data); } catch (e) { return null; } })() : null;
-    const result = await videohaoScraper.fetchProfileAndPosts(account.sec_uid || account.unique_id, authState, 0, null, null, {});
-    if (result.cookieExpired) {
-      return { success: false, status: 401, message: '视频号授权已失效，请重新扫码登录', data: { needRelogin: true } };
-    }
-    return result.success
-      ? { success: true, profileData: result.data?.profile || {} }
-      : { success: false, status: 502, message: result.error || '视频号账号资料同步失败' };
   }
 
   return { success: false, status: 400, message: '暂不支持该平台资料同步' };
@@ -1671,16 +1583,7 @@ router.get('/global-cookie/status', async (req, res) => {
     if (platform) {
       const normalizedPlatform = normalizeGlobalCookiePlatform(platform);
       if (normalizedPlatform === 'videohao') {
-        return res.json({
-          code: 0,
-          data: {
-            hasCookie: false,
-            platform: 'videohao',
-            updatedAt: null,
-            isValid: false,
-            mode: 'desktop-wechat'
-          }
-        });
+        return res.json({ code: 0, data: await videohao.status() });
       }
       const rows = await database.getGlobalCookies([getGlobalCookieId(normalizedPlatform)]);
       const cookie = rows[0];
@@ -1717,7 +1620,7 @@ router.get('/global-cookie/status', async (req, res) => {
         platforms: {
           douyin: byPlatform.douyin || { hasCookie: false, platform: 'douyin', updatedAt: null, isValid: false },
           xiaohongshu: byPlatform.xiaohongshu || { hasCookie: false, platform: 'xiaohongshu', updatedAt: null, isValid: false },
-          videohao: { hasCookie: false, platform: 'videohao', updatedAt: null, isValid: false, mode: 'desktop-wechat' }
+          videohao: { hasCookie: false, platform: 'videohao', updatedAt: null, isValid: false, mode: videohao.mode }
         }
       }
     });
@@ -1729,8 +1632,17 @@ router.get('/global-cookie/status', async (req, res) => {
 // 保存全局Cookie（扫码登录成功后调用）
 router.post('/global-cookie/save', async (req, res) => {
   try {
-    const { cookieData } = req.body;
+    let { cookieData } = req.body;
+    const { sessionId } = req.body;
     const platform = normalizeGlobalCookiePlatform(req.body.platform);
+    if (sessionId) {
+      const loginService = platform === 'douyin' ? qrLoginService : platform === 'xiaohongshu' ? xhsQrLoginService : null;
+      const session = loginService?.getSessionStatus(sessionId);
+      if (!session?.globalCookie || session.status !== 'confirmed' || !session.cookieData) {
+        return res.status(409).json({ code: 409, message: '扫码授权尚未完成或已过期，请重新扫码' });
+      }
+      cookieData = session.cookieData;
+    }
     if (!cookieData) {
       return res.status(400).json({ code: 400, message: 'cookieData不能为空' });
     }

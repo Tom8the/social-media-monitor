@@ -40,6 +40,9 @@ export const accountApi = {
   // 扫码登录相关
   generateQRCode: (data) => api.post('/accounts/qr-code/generate', data, { timeout: 120000 }),
   getQRCodeStatus: (sessionId) => api.get(`/accounts/qr-code/status/${sessionId}`),
+  getLoginPreview: (sessionId, signal) => api.get(`/accounts/qr-code/preview/${sessionId}`, { responseType: 'blob', signal }),
+  sendLoginInputs: (sessionId, events) => api.post(`/accounts/qr-code/input/${sessionId}`, { events }),
+  cancelLogin: (sessionId) => api.delete(`/accounts/qr-code/session/${sessionId}`),
   mockScan: (data) => api.post('/accounts/qr-code/mock-scan', data),
   confirmLogin: (data) => api.post('/accounts/qr-code/confirm', data),
   // 全局采集Cookie
@@ -51,7 +54,7 @@ export const accountApi = {
   startVideohaoLocalProxy: (data) => api.post('/videohao-local-proxy/start', data, { timeout: 120000 }),
   configureVideohaoLocalProxy: (data) => api.post('/videohao-local-proxy/configure', data, { timeout: 120000 }),
   desktopVideohaoSync: (data) => api.post('/videohao-local-proxy/desktop-sync', data, { timeout: 120000 }),
-  getVideohaoDesktopStatus: () => api.get('/videohao-local-proxy/desktop-status', { timeout: 20000 }),
+  getVideohaoCaptureStatus: () => api.get('/accounts/videohao/status', { timeout: 30000 }),
   stopVideohaoLocalProxy: () => api.post('/videohao-local-proxy/stop'),
   disableVideohaoSystemProxy: () => api.post('/videohao-local-proxy/disable-system-proxy'),
   getVideohaoLocalProxyStatus: () => api.get('/videohao-local-proxy/status'),

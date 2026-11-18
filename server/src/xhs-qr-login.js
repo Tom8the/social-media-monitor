@@ -3,6 +3,9 @@ const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const XiaohongshuScraper = require('./xhs-scraper');
+const { createInteractivePage, openLoginPage } = require('./login-preview');
+
+const currentUserUrl = 'https://edith.xiaohongshu.com/api/sns/web/v2/user/me';
 
 puppeteer.use(StealthPlugin());
 
@@ -11,12 +14,13 @@ class XhsQRLoginService {
     this.sessions = new Map();
   }
 
-  async createSession() {
+  async createSession({ globalCookie = false } = {}) {
     const sessionId = uuidv4();
     const session = {
       id: sessionId,
       platform: 'xiaohongshu',
-      status: 'pending',
+      globalCookie,
+      status: globalCookie ? 'opening' : 'pending',
       userData: null,
       cookieData: null,
       error: null,
@@ -28,8 +32,22 @@ class XhsQRLoginService {
 
     this.sessions.set(sessionId, session);
 
+    if (globalCookie) {
+      this._startExpiryCheck(sessionId);
+      void this._startInteractiveLogin(session).then(() => {
+        if (session.status === 'pending') this._monitorLoginStatus(session);
+      }).catch(async error => {
+        if (!['opening', 'pending', 'scanned'].includes(session.status)) return;
+        console.error('[XHSQRLogin] 无法打开授权页:', error.name);
+        session.status = 'error';
+        session.error = '无法打开小红书登录页，请重试';
+        await this._closeSession(session);
+      });
+      return { sessionId, status: session.status, expiresAt: session.expiresAt };
+    }
+
     for (const [oldId, oldSession] of this.sessions) {
-      if (oldId !== sessionId && oldSession.browser) {
+      if (!globalCookie && !oldSession.globalCookie && oldId !== sessionId && oldSession.browser) {
         try { await oldSession.browser.close(); } catch (e) {}
         oldSession.browser = null;
         oldSession.page = null;
@@ -42,6 +60,7 @@ class XhsQRLoginService {
     } catch (error) {
       session.status = 'error';
       session.error = error.message;
+      await this._closeSession(session);
     }
 
     this._startExpiryCheck(sessionId);
@@ -50,6 +69,7 @@ class XhsQRLoginService {
       sessionId,
       qrCode: null,
       status: session.status,
+      error: session.error,
       expiresAt: session.expiresAt
     };
   }
@@ -72,9 +92,10 @@ class XhsQRLoginService {
       ]
     });
 
+    if (session.status === 'expired') return browser.close();
+    session.browser = browser;
     const page = await browser.newPage();
     await page.setViewport({ width: 1280, height: 860 });
-    session.browser = browser;
     session.page = page;
 
     await page.goto('https://www.xiaohongshu.com/explore', {
@@ -84,7 +105,20 @@ class XhsQRLoginService {
 
     await this._wait(3000);
     await this._openLoginPanel(page);
-    session.status = 'pending';
+  }
+
+  async _startInteractiveLogin(session) {
+    const page = await createInteractivePage(session);
+    if (!page) return;
+    page.on('response', async response => {
+      if (response.url().split('?')[0] !== currentUserUrl) return;
+      try {
+        const result = await response.json();
+        const user = result?.data;
+        if (result?.success && (user?.user_id || user?.userid) && user.guest === false) session.verifiedLogin = true;
+      } catch {}
+    });
+    await openLoginPage(session, page, 'https://www.xiaohongshu.com/login');
   }
 
   async _openLoginPanel(page) {
@@ -124,6 +158,7 @@ class XhsQRLoginService {
   }
 
   _monitorLoginStatus(session) {
+    let checking = false;
     const timer = setInterval(async () => {
       if (!this.sessions.has(session.id)) {
         clearInterval(timer);
@@ -141,12 +176,25 @@ class XhsQRLoginService {
         return;
       }
 
+      if (checking) return;
+      checking = true;
       try {
         const page = session.page;
         if (!page) return;
 
-        const cookies = await page.cookies('https://www.xiaohongshu.com');
+        const cookies = session.globalCookie ? await page.context().cookies('https://www.xiaohongshu.com') : await page.cookies('https://www.xiaohongshu.com');
         const hasLoginCookie = cookies.some(cookie => cookie.name === 'web_session');
+        if (session.globalCookie) {
+          if (!hasLoginCookie || !cookies.some(cookie => cookie.name === 'a1' && cookie.value)) return;
+          if (!session.verifiedLogin && !await this._fetchCurrentUserFromApi(page, true)) return;
+          const confirmedCookies = await page.context().cookies(['https://www.xiaohongshu.com', 'https://edith.xiaohongshu.com']);
+          if (!session.page || Date.now() >= session.expiresAt) return;
+          session.cookieData = JSON.stringify(confirmedCookies);
+          session.status = 'confirmed';
+          clearInterval(timer);
+          await this._closeSession(session);
+          return;
+        }
         const currentUser = hasLoginCookie ? await this._fetchCurrentUserFromApi(page) : null;
         const loggedInByUi = await page.evaluate(() => {
           const text = document.body.innerText || '';
@@ -187,6 +235,8 @@ class XhsQRLoginService {
         }
       } catch (error) {
         console.log('[XHSQRLogin] 监听登录状态失败:', error.message);
+      } finally {
+        checking = false;
       }
     }, 3000);
   }
@@ -294,21 +344,21 @@ class XhsQRLoginService {
     }
   }
 
-  async _fetchCurrentUserFromApi(page) {
+  async _fetchCurrentUserFromApi(page, requireVerifiedUser = false) {
     try {
-      const result = await page.evaluate(async () => {
-        const response = await fetch('https://edith.xiaohongshu.com/api/sns/web/v2/user/me', {
-          credentials: 'include'
+      const result = await page.evaluate(async (url) => {
+        const response = await fetch(url, {
+          credentials: 'include', signal: AbortSignal.timeout(5000)
         });
         if (!response.ok) return null;
         return response.json();
-      });
+      }, currentUserUrl);
 
       const user = result?.data;
-      if (!result?.success || !user?.user_id || user.guest) return null;
+      if (!result?.success || !(user?.user_id || user?.userid) || user.guest || (requireVerifiedUser && user.guest !== false)) return null;
 
       return {
-        unique_id: user.user_id,
+        unique_id: user.user_id || user.userid,
         sec_uid: user.red_id || null,
         nickname: user.nickname || '',
         avatar: user.images || user.imageb || '',
@@ -325,6 +375,7 @@ class XhsQRLoginService {
 
     return {
       sessionId: session.id,
+      globalCookie: session.globalCookie,
       status: session.status,
       userData: session.status === 'confirmed' ? session.userData : null,
       cookieData: session.status === 'confirmed' ? session.cookieData : null,
@@ -332,29 +383,23 @@ class XhsQRLoginService {
     };
   }
 
-  getQRImagePath() {
-    return null;
-  }
-
   _startExpiryCheck(sessionId) {
+    const expiresAt = this.sessions.get(sessionId).expiresAt;
     setTimeout(() => {
       const session = this.sessions.get(sessionId);
       if (!session) return;
 
-      if (session.status !== 'confirmed') {
-        session.status = 'expired';
-        this._closeSession(session);
-        setTimeout(() => this.sessions.delete(sessionId), 5000);
-      }
-    }, 5 * 60 * 1000);
+      if (['opening', 'pending', 'scanned'].includes(session.status)) session.status = 'expired';
+      this._closeSession(session);
+      setTimeout(() => this.sessions.delete(sessionId), 5000);
+    }, Math.max(0, expiresAt - Date.now()));
   }
 
-  _closeSession(session) {
-    if (session.browser) {
-      try { session.browser.close(); } catch (e) {}
-      session.browser = null;
-      session.page = null;
-    }
+  async _closeSession(session) {
+    const browser = session.browser;
+    session.browser = null;
+    session.page = null;
+    if (browser) await browser.close().catch(() => {});
   }
 
   _findChromePath() {
